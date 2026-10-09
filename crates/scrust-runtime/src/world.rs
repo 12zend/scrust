@@ -185,6 +185,7 @@ impl Drop for LocalsBox {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct CostumeDef {
     pub name: &'static str,
     pub md5ext: &'static str,
@@ -195,6 +196,7 @@ pub struct CostumeDef {
     pub center_y: f64,
 }
 
+#[derive(Clone, Copy)]
 pub struct SoundDef {
     pub name: &'static str,
     pub md5ext: &'static str,

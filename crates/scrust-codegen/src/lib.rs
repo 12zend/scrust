@@ -120,6 +120,21 @@ fn rust_str(s: &str) -> String {
     format!("{:?}", s)
 }
 
+/// A list's initial item as a `Lit` (see `scrust_runtime::Lit`).
+fn lit_item(v: &Value) -> String {
+    match v {
+        Value::Num(n) => format!("Lit::N({})", f64_lit(*n)),
+        Value::Bool(b) => format!("Lit::B({b})"),
+        Value::Str(s) => {
+            let units = s.to_utf16();
+            match String::from_utf16(&units) {
+                Ok(text) => format!("Lit::S({text:?})"),
+                Err(_) => format!("Lit::U(&{units:?})"),
+            }
+        }
+    }
+}
+
 impl<'a> Gen<'a> {
     fn line(&mut self, s: &str) {
         for _ in 0..self.indent {
@@ -168,11 +183,15 @@ impl<'a> Gen<'a> {
             o.turbo,
             o.warp_timer
         );
+        let mut statics = String::new();
         s.push_str("pub fn program() -> ProgramDef {\n    ProgramDef {\n        sprites: vec![\n");
         for (ti, t) in p.targets.iter().enumerate() {
             let src = &self.project.targets[ti];
             let _ = writeln!(s, "            SpriteDef {{\n                name: {},\n                is_stage: {},", rust_str(&t.name), t.is_stage);
-            s.push_str("                costumes: vec![\n");
+            // Embedded asset tables are statics (data, not code); external
+            // assets are loaded at run time and need a function body.
+            let table = !o.external_assets;
+            let mut rows = String::new();
             for c in &src.costumes {
                 let data = if o.headless {
                     "&[]".to_string()
@@ -184,8 +203,8 @@ impl<'a> Gen<'a> {
                     format!("include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/assets/\", {}))", rust_str(&c.md5ext))
                 };
                 let _ = writeln!(
-                    s,
-                    "                    CostumeDef {{ name: {}, md5ext: {}, data_format: {}, data: {}, bitmap_resolution: {}, center_x: {}, center_y: {} }},",
+                    rows,
+                    "    CostumeDef {{ name: {}, md5ext: {}, data_format: {}, data: {}, bitmap_resolution: {}, center_x: {}, center_y: {} }},",
                     rust_str(&c.name),
                     rust_str(&c.md5ext),
                     rust_str(&c.data_format),
@@ -195,7 +214,8 @@ impl<'a> Gen<'a> {
                     f64_lit(c.rotation_center_y)
                 );
             }
-            s.push_str("                ],\n                sounds: vec![\n");
+            self.table(&mut s, &mut statics, table, "CostumeDef", &format!("T{ti}_COSTUMES"), src.costumes.len(), &rows, "costumes");
+            let mut rows = String::new();
             for c in &src.sounds {
                 let data = if o.headless {
                     "&[]".to_string()
@@ -207,8 +227,8 @@ impl<'a> Gen<'a> {
                     format!("include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/assets/\", {}))", rust_str(&c.md5ext))
                 };
                 let _ = writeln!(
-                    s,
-                    "                    SoundDef {{ name: {}, md5ext: {}, data_format: {}, data: {}, rate: {}, sample_count: {} }},",
+                    rows,
+                    "    SoundDef {{ name: {}, md5ext: {}, data_format: {}, data: {}, rate: {}, sample_count: {} }},",
                     rust_str(&c.name),
                     rust_str(&c.md5ext),
                     rust_str(&c.data_format),
@@ -217,7 +237,8 @@ impl<'a> Gen<'a> {
                     f64_lit(c.sample_count)
                 );
             }
-            s.push_str("                ],\n                scripts: vec![\n");
+            self.table(&mut s, &mut statics, table, "SoundDef", &format!("T{ti}_SOUNDS"), src.sounds.len(), &rows, "sounds");
+            s.push_str("                scripts: vec![\n");
             for (si, sc) in t.scripts.iter().enumerate() {
                 let (kind, field, msg) = match &sc.hat {
                     Hat::FlagClicked => ("Flag", String::new(), 0),
@@ -275,7 +296,20 @@ impl<'a> Gen<'a> {
             }
         }
         s.push_str("        ],\n    }\n}\n");
+        s.push_str(&statics);
         s
+    }
+
+    /// A `field: ...` initialiser of `SpriteDef` for the rows of a costume or
+    /// sound table, as a static (`table`) or inline.
+    #[allow(clippy::too_many_arguments)]
+    fn table(&self, s: &mut String, statics: &mut String, table: bool, ty: &str, name: &str, len: usize, rows: &str, field: &str) {
+        if table {
+            let _ = write!(statics, "\nstatic {name}: [{ty}; {len}] = [\n{rows}];\n");
+            let _ = writeln!(s, "                {field}: {name}.to_vec(),");
+        } else {
+            let _ = writeln!(s, "                {field}: vec![\n{rows}                ],");
+        }
     }
 
     fn monitor_def(&self, m: &scrust_sb3::Monitor) -> Option<String> {
@@ -377,13 +411,28 @@ impl<'a> Gen<'a> {
             let init = E::lit(v.init.clone()).as_repr(r);
             self.line(&format!("        v{i}: {init},"));
         }
+        // Initial items live in statics: plain data instead of code, which
+        // keeps large lists from dominating the build (LLVM is superlinear
+        // in function size).
+        let mut statics = String::new();
         for (i, l) in t.lists.iter().enumerate() {
             let r = self.an.repr(Node::List(ListId { target: ti, index: i }));
-            let items: Vec<String> = l.init.iter().map(|v| E::lit(v.clone()).as_repr(r)).collect();
-            self.line(&format!("        l{i}: List::new(vec![{}]),", items.join(", ")));
+            if l.init.is_empty() {
+                self.line(&format!("        l{i}: List::new(Vec::new()),"));
+            } else if r == Repr::F64 {
+                let items: Vec<String> = l.init.iter().map(|v| E::lit(v.clone()).as_repr(r)).collect();
+                let _ = writeln!(statics, "static L{ti}_INIT{i}: [f64; {}] = [{}];", items.len(), items.join(", "));
+                self.line(&format!("        l{i}: List::from_nums(&L{ti}_INIT{i}),"));
+            } else {
+                let items: Vec<String> = l.init.iter().map(lit_item).collect();
+                let _ = writeln!(statics, "static L{ti}_INIT{i}: [Lit; {}] = [{}];", items.len(), items.join(", "));
+                self.line(&format!("        l{i}: List::from_lits(&L{ti}_INIT{i}),"));
+            }
         }
         self.line("    })");
         self.line("}");
+        self.line("");
+        self.out.push_str(&statics);
         self.line("");
         self.line(&format!("impl Locals for L{ti} {{"));
         self.line("    fn clone_box(&self) -> Box<dyn Locals> { Box::new(self.clone()) }");

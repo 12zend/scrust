@@ -10,7 +10,7 @@ pub mod trace;
 pub mod vaudio;
 pub mod world;
 
-pub use list::{Elem, List};
+pub use list::{Elem, List, Lit};
 pub use sched::{die, step, wait_external, yield_loop, yield_now, yield_status, yield_tick, BoxFut, HatKind, Status, Wake};
 pub use scrust_value as value;
 pub use scrust_value::{JsStr, ListIndex, MathOp, ToBool, ToNum, ToStr, ToValue, Value};
@@ -19,7 +19,7 @@ pub use world::*;
 /// Everything generated code needs.
 pub mod prelude {
     pub use crate::blocks::Glide;
-    pub use crate::list::{Elem, List};
+    pub use crate::list::{Elem, List, Lit};
     pub use crate::sched::{die, wait_external, yield_loop, yield_now, yield_status, yield_tick, BoxFut, HatKind, Status, Wake};
     pub use crate::world::*;
     pub use crate::{val_bool, val_num, val_str};

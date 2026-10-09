@@ -78,6 +78,41 @@ impl Elem for JsStr {
     }
 }
 
+/// A list's initial item as generated code stores it: plain static data, so
+/// that large lists cost the compiler nothing beyond the bytes themselves.
+#[derive(Clone, Copy)]
+pub enum Lit {
+    N(f64),
+    S(&'static str),
+    /// A string with lone surrogates (not representable as `&str`).
+    U(&'static [u16]),
+    B(bool),
+}
+
+impl Lit {
+    pub fn to_value(self) -> Value {
+        match self {
+            Lit::N(n) => Value::Num(n),
+            Lit::S(s) => Value::Str(JsStr::from(s)),
+            Lit::U(u) => Value::Str(JsStr::from_utf16(u)),
+            Lit::B(b) => Value::Bool(b),
+        }
+    }
+}
+
+impl<T: Elem> List<T> {
+    /// A list from static initial items, converted as `Elem::from_value` does.
+    pub fn from_lits(lits: &[Lit]) -> Self {
+        List { items: lits.iter().map(|l| T::from_value(&l.to_value())).collect() }
+    }
+}
+
+impl List<f64> {
+    pub fn from_nums(nums: &[f64]) -> Self {
+        List { items: nums.to_vec() }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct List<T: Elem> {
     pub items: Vec<T>,
