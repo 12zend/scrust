@@ -1,0 +1,11 @@
+[package]
+name = "scrust-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+scrust-value.workspace = true
+scrust-sb3.workspace = true
+scrust-ir.workspace = true
+scrust-analysis.workspace = true

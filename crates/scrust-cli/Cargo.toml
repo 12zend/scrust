@@ -1,0 +1,16 @@
+[package]
+name = "scrust-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scrust"
+path = "src/main.rs"
+
+[dependencies]
+scrust-value.workspace = true
+scrust-sb3.workspace = true
+scrust-ir.workspace = true
+scrust-analysis.workspace = true
+scrust-codegen.workspace = true

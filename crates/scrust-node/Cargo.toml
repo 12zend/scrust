@@ -1,0 +1,12 @@
+[package]
+name = "scrust-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "scrust-render's scene as a Node-API addon for the GUI (the scratch-render replacement)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+scrust-render.workspace = true

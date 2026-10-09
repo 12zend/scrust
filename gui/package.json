@@ -1,0 +1,19 @@
+{
+  "name": "scrust-gui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TurboWarp's scratch-gui in Electron, running projects through the scrust Scratch-to-Rust compiler",
+  "license": "GPL-3.0",
+  "main": "electron/main.js",
+  "scripts": {
+    "setup": "node scripts/setup.js",
+    "build": "node scripts/build.js",
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "43.7.3"
+  },
+  "allowScripts": {
+    "electron": true
+  }
+}

@@ -1,0 +1,596 @@
+//! Metal compositor: draws sprites (with their graphic effects), the pen
+//! layer and the text overlays on the GPU, and keeps the pen layer as a GPU
+//! texture that pen lines and stamps are rendered into.
+//!
+//! Only presentation moves to the GPU. Collision queries keep sampling the
+//! CPU silhouettes (`touching_skin`), as scratch-render does; `touching
+//! color` reads the pen layer back when it changed (`pen_pixels`).
+//!
+//! The shaders mirror the CPU path: the same model transform (`Xf`), the
+//! effect formulas of `Effects::point` / `Effects::color`, nearest sampling
+//! for distorted or 1:1 drawables and bilinear sampling (transparent outside
+//! the texture) otherwise, and premultiplied "over" blending.
+
+use crate::skin::{Raster, Skin};
+use crate::{Draw, STAGE_HEIGHT, STAGE_WIDTH};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
+    MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLSize, MTLStorageMode,
+    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
+type Tex = Retained<ProtocolObject<dyn MTLTexture>>;
+type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
+type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+type Sampler = Retained<ProtocolObject<dyn MTLSamplerState>>;
+
+const SHADERS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Per drawable. m: model matrix (m00, m01, m10, m11); t: translation and the
+// stage's half size; size: skin size (stage units), distort, recolor;
+// fxa: color, fisheye, whirl, pixelate; fxb: mosaic, brightness, ghost.
+struct Sprite { float4 m; float4 t; float4 size; float4 fxa; float4 fxb; };
+
+struct SpriteOut { float4 pos [[position]]; float2 uv; };
+
+vertex SpriteOut sprite_vs(uint vid [[vertex_id]], constant Sprite& s [[buffer(0)]]) {
+    float2 uv = float2(float(vid & 1), float(vid >> 1));
+    float2 l = float2(0.5 - uv.x, uv.y - 0.5);
+    float2 w = float2(s.m.x * l.x + s.m.y * l.y + s.t.x, s.m.z * l.x + s.m.w * l.y + s.t.y);
+    SpriteOut o;
+    o.pos = float4(w.x / s.t.z, w.y / s.t.w, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+float2 effect_point(float2 uv, constant Sprite& s) {
+    float mosaic = s.fxb.x, pixelate = s.fxa.w, whirl = s.fxa.z, fisheye = s.fxa.y;
+    if (mosaic != 0.0) {
+        float m = clamp(round((abs(mosaic) + 10.0) / 10.0), 1.0, 512.0);
+        uv = fract(m * uv);
+    }
+    if (pixelate != 0.0) {
+        float p = abs(pixelate) / 10.0;
+        float2 t = s.size.xy / p;
+        uv = (floor(uv * t) + 0.5) / t;
+    }
+    if (whirl != 0.0) {
+        float2 o = uv - 0.5;
+        float mag = length(o);
+        float factor = max(1.0 - mag / 0.5, 0.0);
+        float a = (-whirl * M_PI_F / 180.0) * factor * factor;
+        float sn = sin(a), cs = cos(a);
+        uv = float2(cs * o.x + sn * o.y + 0.5, -sn * o.x + cs * o.y + 0.5);
+    }
+    if (fisheye != 0.0) {
+        float2 v = (uv - 0.5) / 0.5;
+        float len = length(v);
+        if (len > 0.0) {
+            float power = max((fisheye + 100.0) / 100.0, 0.0);
+            float r = pow(min(len, 1.0), power) * max(len, 1.0);
+            uv = 0.5 + r * (v / len) * 0.5;
+        }
+    }
+    return uv;
+}
+
+float3 rgb_to_hsv(float3 c) {
+    float mx = max(max(c.r, c.g), c.b), mn = min(min(c.r, c.g), c.b), d = mx - mn;
+    float h = 0.0;
+    if (d != 0.0) {
+        if (mx == c.r) { float q = (c.g - c.b) / d; h = (q - 6.0 * floor(q / 6.0)) / 6.0; }
+        else if (mx == c.g) h = ((c.b - c.r) / d + 2.0) / 6.0;
+        else h = ((c.r - c.g) / d + 4.0) / 6.0;
+    }
+    return float3(h, mx == 0.0 ? 0.0 : d / mx, mx);
+}
+
+float3 hsv_to_rgb(float3 c) {
+    float i = floor(c.x * 6.0), f = c.x * 6.0 - i, v = c.z, s = c.y;
+    float p = v * (1.0 - s), q = v * (1.0 - f * s), t = v * (1.0 - (1.0 - f) * s);
+    int k = int(i - 6.0 * floor(i / 6.0));
+    if (k == 0) return float3(v, t, p);
+    if (k == 1) return float3(q, v, p);
+    if (k == 2) return float3(p, v, t);
+    if (k == 3) return float3(p, q, v);
+    if (k == 4) return float3(t, p, v);
+    return float3(v, p, q);
+}
+
+float4 effect_color(float4 c, constant Sprite& s) {
+    float a = c.a;
+    float3 rgb = c.rgb / a;
+    float color = s.fxa.x, brightness = s.fxb.y, ghost = s.fxb.z;
+    if (color != 0.0) {
+        float3 hsv = rgb_to_hsv(rgb);
+        const float MIN_V = 0.11 / 2.0, MIN_S = 0.09;
+        if (hsv.z < MIN_V) hsv = float3(0.0, 1.0, MIN_V);
+        else if (hsv.y < MIN_S) hsv = float3(0.0, MIN_S, hsv.z);
+        hsv.x = fract(hsv.x + color / 200.0);
+        rgb = hsv_to_rgb(hsv);
+    }
+    if (brightness != 0.0) rgb = clamp(rgb + brightness / 100.0, 0.0, 1.0);
+    if (ghost != 0.0) a *= clamp(1.0 - ghost / 100.0, 0.0, 1.0);
+    return float4(rgb * a, a);
+}
+
+fragment float4 sprite_fs(SpriteOut in [[stage_in]], constant Sprite& s [[buffer(0)]],
+                          texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {
+    float2 uv = in.uv;
+    if (s.size.z != 0.0) {
+        uv = effect_point(uv, s);
+        if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) discard_fragment();
+    }
+    float4 c = tex.sample(smp, uv);
+    if (c.a <= 0.0) discard_fragment();
+    if (s.size.w != 0.0) c = effect_color(c, s);
+    return c;
+}
+
+// Screen-aligned textured rectangle (pen layer, bubbles, monitors), in NDC.
+struct Rect { float4 r; };
+
+vertex SpriteOut rect_vs(uint vid [[vertex_id]], constant Rect& q [[buffer(0)]]) {
+    float2 uv = float2(float(vid & 1), float(vid >> 1));
+    SpriteOut o;
+    o.pos = float4(mix(q.r.x, q.r.z, uv.x), mix(q.r.y, q.r.w, uv.y), 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+
+fragment float4 rect_fs(SpriteOut in [[stage_in]], texture2d<float> tex [[texture(0)]], sampler smp [[sampler(0)]]) {
+    return tex.sample(smp, in.uv);
+}
+
+// Pen line: a round-capped segment in device pixels, anti-aliased by
+// distance (p: endpoints; color: straight RGBA; misc: radius, target size).
+struct Line { float4 p; float4 color; float4 misc; };
+
+struct LineOut {
+    float4 pos [[position]];
+    float2 a [[flat]]; float2 b [[flat]]; float r [[flat]]; float4 color [[flat]];
+};
+
+vertex LineOut line_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Line* lines [[buffer(0)]]) {
+    Line l = lines[iid];
+    float2 a = l.p.xy, b = l.p.zw;
+    float r = l.misc.x;
+    float2 d = b - a;
+    float len = length(d);
+    float2 dir = len > 1e-4 ? d / len : float2(1.0, 0.0);
+    float2 n = float2(-dir.y, dir.x);
+    float e = r + 1.0;
+    float2 c = ((vid & 1) ? b + dir * e : a - dir * e) + n * ((vid >> 1) ? e : -e);
+    LineOut o;
+    o.pos = float4(c.x / l.misc.y * 2.0 - 1.0, 1.0 - c.y / l.misc.z * 2.0, 0.0, 1.0);
+    o.a = a; o.b = b; o.r = r; o.color = l.color;
+    return o;
+}
+
+fragment float4 line_fs(LineOut in [[stage_in]]) {
+    float2 p = in.pos.xy;
+    float2 ab = in.b - in.a;
+    float t = dot(ab, ab) > 0.0 ? clamp(dot(p - in.a, ab) / dot(ab, ab), 0.0, 1.0) : 0.0;
+    float dist = length(p - (in.a + t * ab));
+    float cover = clamp(in.r + 0.5 - dist, 0.0, 1.0);
+    if (cover <= 0.0) discard_fragment();
+    float alpha = in.color.a * cover;
+    return float4(in.color.rgb * alpha, alpha);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SpriteUniforms {
+    m: [f32; 4],
+    t: [f32; 4],
+    size: [f32; 4],
+    fxa: [f32; 4],
+    fxb: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct LineInstance {
+    p: [f32; 4],
+    color: [f32; 4],
+    misc: [f32; 4],
+}
+
+#[derive(Clone)]
+struct Quad {
+    tex: Tex,
+    u: SpriteUniforms,
+    nearest: bool,
+}
+
+enum Item {
+    Sprite(Quad),
+    /// Texture and NDC rectangle (left, top, right, bottom).
+    Rect(Tex, [f32; 4]),
+}
+
+enum PenOp {
+    Clear,
+    Lines(Vec<LineInstance>),
+    Stamp(Quad),
+}
+
+pub(crate) struct Gpu {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    sprite: Pipeline,
+    rect: Pipeline,
+    line: Pipeline,
+    linear: Sampler,
+    nearest: Sampler,
+    width: usize,
+    height: usize,
+    target: Tex,
+    pen: Tex,
+    readback: Buf,
+    /// Skin rasters by (skin uid, width, height) with the frame they were last used in.
+    skins: HashMap<(u64, usize, usize), (Tex, u64)>,
+    /// Overlay textures by slot (reused while the size stays the same).
+    overlays: HashMap<u64, Tex>,
+    frame_no: u64,
+    background: [u8; 3],
+    items: Vec<Item>,
+    pen_ops: Vec<PenOp>,
+    /// CPU copy of the pen layer (premultiplied), valid until the next pen operation.
+    pen_copy: Option<Raster>,
+}
+
+fn pipeline(device: &ProtocolObject<dyn MTLDevice>, lib: &ProtocolObject<dyn MTLLibrary>, vs: &str, fs: &str) -> Option<Pipeline> {
+    let desc = MTLRenderPipelineDescriptor::new();
+    let vs = lib.newFunctionWithName(&NSString::from_str(vs))?;
+    let fs = lib.newFunctionWithName(&NSString::from_str(fs))?;
+    desc.setVertexFunction(Some(&vs));
+    desc.setFragmentFunction(Some(&fs));
+    // SAFETY: index 0 always exists.
+    let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
+    att.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+    att.setBlendingEnabled(true);
+    att.setSourceRGBBlendFactor(MTLBlendFactor::One);
+    att.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+    att.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    att.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    device.newRenderPipelineStateWithDescriptor_error(&desc).ok()
+}
+
+fn sampler(device: &ProtocolObject<dyn MTLDevice>, filter: MTLSamplerMinMagFilter) -> Option<Sampler> {
+    let desc = MTLSamplerDescriptor::new();
+    desc.setMinFilter(filter);
+    desc.setMagFilter(filter);
+    desc.setSAddressMode(MTLSamplerAddressMode::ClampToZero);
+    desc.setTAddressMode(MTLSamplerAddressMode::ClampToZero);
+    device.newSamplerStateWithDescriptor(&desc)
+}
+
+fn texture(device: &ProtocolObject<dyn MTLDevice>, w: usize, h: usize, target: bool) -> Option<Tex> {
+    // SAFETY: plain descriptor construction.
+    let desc = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::RGBA8Unorm, w.max(1), h.max(1), false) };
+    if target {
+        desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+        desc.setStorageMode(MTLStorageMode::Private);
+    } else {
+        desc.setUsage(MTLTextureUsage::ShaderRead);
+        desc.setStorageMode(MTLStorageMode::Managed);
+    }
+    device.newTextureWithDescriptor(&desc)
+}
+
+fn upload(tex: &ProtocolObject<dyn MTLTexture>, r: &Raster) {
+    if r.w == 0 || r.h == 0 || r.data.len() < r.w * r.h * 4 {
+        return;
+    }
+    let region = MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 }, size: MTLSize { width: r.w, height: r.h, depth: 1 } };
+    // SAFETY: the texture is `r.w` x `r.h` RGBA8 and `r.data` holds that many pixels.
+    unsafe { tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(region, 0, NonNull::new_unchecked(r.data.as_ptr() as *mut c_void), r.w * 4) };
+}
+
+fn pass(texture: &ProtocolObject<dyn MTLTexture>, clear: Option<[f64; 4]>) -> Retained<MTLRenderPassDescriptor> {
+    let desc = MTLRenderPassDescriptor::renderPassDescriptor();
+    // SAFETY: index 0 always exists.
+    let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
+    att.setTexture(Some(texture));
+    match clear {
+        Some(c) => {
+            att.setLoadAction(MTLLoadAction::Clear);
+            att.setClearColor(MTLClearColor { red: c[0], green: c[1], blue: c[2], alpha: c[3] });
+        }
+        None => att.setLoadAction(MTLLoadAction::Load),
+    }
+    att.setStoreAction(MTLStoreAction::Store);
+    desc
+}
+
+impl Gpu {
+    /// A compositor for a `width` x `height` (device pixels) output, or None
+    /// when there is no Metal device or `SCRUST_RENDERER=cpu` is set.
+    pub fn new(width: usize, height: usize) -> Option<Gpu> {
+        if std::env::var("SCRUST_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu")) {
+            return None;
+        }
+        let device = MTLCreateSystemDefaultDevice()?;
+        let queue = device.newCommandQueue()?;
+        let lib = match device.newLibraryWithSource_options_error(&NSString::from_str(SHADERS), None) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("scrust: Metal shaders failed to compile, drawing on the CPU: {e}");
+                return None;
+            }
+        };
+        let (w, h) = (width.max(1), height.max(1));
+        let mut gpu = Gpu {
+            sprite: pipeline(&device, &lib, "sprite_vs", "sprite_fs")?,
+            rect: pipeline(&device, &lib, "rect_vs", "rect_fs")?,
+            line: pipeline(&device, &lib, "line_vs", "line_fs")?,
+            linear: sampler(&device, MTLSamplerMinMagFilter::Linear)?,
+            nearest: sampler(&device, MTLSamplerMinMagFilter::Nearest)?,
+            target: texture(&device, w, h, true)?,
+            pen: texture(&device, w, h, true)?,
+            readback: device.newBufferWithLength_options(w * h * 4, MTLResourceOptions::StorageModeShared)?,
+            width: w,
+            height: h,
+            skins: HashMap::new(),
+            overlays: HashMap::new(),
+            frame_no: 0,
+            background: [255, 255, 255],
+            items: Vec::new(),
+            pen_ops: vec![PenOp::Clear],
+            pen_copy: None,
+            device,
+            queue,
+        };
+        gpu.pen_copy = Some(Raster::new(w, h));
+        Some(gpu)
+    }
+
+    /// Change the output size (the pen layer is cleared).
+    pub fn resize(&mut self, width: usize, height: usize) -> bool {
+        let (w, h) = (width.max(1), height.max(1));
+        if (w, h) == (self.width, self.height) {
+            return true;
+        }
+        let (Some(target), Some(pen), Some(readback)) = (
+            texture(&self.device, w, h, true),
+            texture(&self.device, w, h, true),
+            self.device.newBufferWithLength_options(w * h * 4, MTLResourceOptions::StorageModeShared),
+        ) else {
+            return false;
+        };
+        (self.target, self.pen, self.readback, self.width, self.height) = (target, pen, readback, w, h);
+        self.pen_ops = vec![PenOp::Clear];
+        self.pen_copy = Some(Raster::new(w, h));
+        true
+    }
+
+    fn skin_texture(&mut self, skin: &mut Skin, pixels_per_unit: f64) -> Option<(Tex, usize, usize)> {
+        let frame = self.frame_no;
+        let uid = skin.uid;
+        let raster = skin.raster_for(pixels_per_unit);
+        let key = (uid, raster.w, raster.h);
+        if let Some((tex, used)) = self.skins.get_mut(&key) {
+            *used = frame;
+            return Some((tex.clone(), raster.w, raster.h));
+        }
+        let tex = texture(&self.device, raster.w, raster.h, false)?;
+        upload(&tex, raster);
+        self.skins.insert(key, (tex.clone(), frame));
+        Some((tex, raster.w, raster.h))
+    }
+
+    /// Uniforms and sampling for drawing `d` at `scale` device pixels per stage unit.
+    fn quad(&mut self, skin: &mut Skin, d: &Draw, scale: f64) -> Option<Quad> {
+        // Same raster choice as `composite`: the MIP level for the drawable's
+        // on-screen density, sampled nearest when distorted or exactly 1:1.
+        let unit = (d.xf.m00.hypot(d.xf.m10) / d.size.0.max(1e-9)).max(d.xf.m01.hypot(d.xf.m11) / d.size.1.max(1e-9));
+        let (tex, tw, th) = self.skin_texture(skin, unit * scale)?;
+        let b = d.xf.aabb();
+        let exact = tw as f64 == (b.right - b.left) * scale && th as f64 == (b.top - b.bottom) * scale;
+        let fx = d.fx;
+        let u = SpriteUniforms {
+            m: [d.xf.m00 as f32, d.xf.m01 as f32, d.xf.m10 as f32, d.xf.m11 as f32],
+            t: [d.xf.tx as f32, d.xf.ty as f32, (STAGE_WIDTH / 2.0) as f32, (STAGE_HEIGHT / 2.0) as f32],
+            size: [d.size.0 as f32, d.size.1 as f32, fx.distorts() as u8 as f32, fx.recolors() as u8 as f32],
+            fxa: [fx.color as f32, fx.fisheye as f32, fx.whirl as f32, fx.pixelate as f32],
+            fxb: [fx.mosaic as f32, fx.brightness as f32, fx.ghost as f32, 0.0],
+        };
+        Some(Quad { tex, u, nearest: exact || fx.distorts() })
+    }
+
+    // ------------------------------------------------------------- frame
+
+    /// Start a frame over an opaque background colour.
+    pub fn begin(&mut self, background: [u8; 3]) {
+        self.frame_no += 1;
+        self.background = background;
+        self.items.clear();
+    }
+
+    pub fn sprite(&mut self, skin: &mut Skin, d: &Draw, scale: f64) {
+        if let Some(q) = self.quad(skin, d, scale) {
+            self.items.push(Item::Sprite(q));
+        }
+    }
+
+    /// Composite the pen layer at this point of the frame.
+    pub fn pen_layer(&mut self) {
+        self.items.push(Item::Rect(self.pen.clone(), [-1.0, 1.0, 1.0, -1.0]));
+    }
+
+    /// A screen-aligned raster at device pixel `(x, y)`; `slot` identifies
+    /// the overlay so its texture can be reused.
+    pub fn overlay(&mut self, slot: u64, r: &Raster, x: i64, y: i64) {
+        if r.w == 0 || r.h == 0 {
+            return;
+        }
+        let reuse = self.overlays.get(&slot).filter(|t| t.width() == r.w && t.height() == r.h).cloned();
+        let Some(tex) = reuse.or_else(|| texture(&self.device, r.w, r.h, false)) else { return };
+        upload(&tex, r);
+        self.overlays.insert(slot, tex.clone());
+        let (w, h) = (self.width as f32, self.height as f32);
+        let ndc_x = |px: f32| px / w * 2.0 - 1.0;
+        let ndc_y = |py: f32| 1.0 - py / h * 2.0;
+        let rect = [ndc_x(x as f32), ndc_y(y as f32), ndc_x((x + r.w as i64) as f32), ndc_y((y + r.h as i64) as f32)];
+        self.items.push(Item::Rect(tex, rect));
+    }
+
+    /// Render the frame and read it back as opaque RGBA into `out`
+    /// (`width * height * 4` bytes).
+    pub fn finish(&mut self, out: &mut [u8]) {
+        let Some(cmd) = self.queue.commandBuffer() else { return };
+        let mut keep: Vec<Buf> = Vec::new();
+        self.encode_pen(&cmd, &mut keep);
+        let bg = self.background;
+        let desc = pass(&self.target, Some([bg[0] as f64 / 255.0, bg[1] as f64 / 255.0, bg[2] as f64 / 255.0, 1.0]));
+        if let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) {
+            for item in &self.items {
+                match item {
+                    Item::Sprite(q) => self.draw_quad(&enc, q),
+                    Item::Rect(tex, rect) => self.draw_rect(&enc, tex, rect),
+                }
+            }
+            enc.endEncoding();
+        }
+        self.items.clear();
+        self.read_into(&cmd, &self.target, out);
+        // Forget skin textures that have not been drawn for a while.
+        let frame = self.frame_no;
+        self.skins.retain(|_, (_, used)| frame - *used < 300);
+    }
+
+    fn draw_quad(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, q: &Quad) {
+        enc.setRenderPipelineState(&self.sprite);
+        let u = NonNull::from(&q.u).cast::<c_void>();
+        let len = std::mem::size_of::<SpriteUniforms>();
+        // SAFETY: `u` points at `len` bytes of uniforms laid out as the shader's `Sprite`.
+        unsafe {
+            enc.setVertexBytes_length_atIndex(u, len, 0);
+            enc.setFragmentBytes_length_atIndex(u, len, 0);
+            enc.setFragmentTexture_atIndex(Some(&q.tex), 0);
+            enc.setFragmentSamplerState_atIndex(Some(if q.nearest { &self.nearest } else { &self.linear }), 0);
+            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+    }
+
+    fn draw_rect(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, tex: &Tex, rect: &[f32; 4]) {
+        enc.setRenderPipelineState(&self.rect);
+        // SAFETY: `rect` is the shader's `Rect` (one float4).
+        unsafe {
+            enc.setVertexBytes_length_atIndex(NonNull::from(rect).cast::<c_void>(), 16, 0);
+            enc.setFragmentTexture_atIndex(Some(tex), 0);
+            enc.setFragmentSamplerState_atIndex(Some(&self.nearest), 0);
+            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+    }
+
+    /// Copy `tex` into `out` through the readback buffer (waits for the GPU).
+    fn read_into(&self, cmd: &ProtocolObject<dyn MTLCommandBuffer>, tex: &Tex, out: &mut [u8]) {
+        let (w, h) = (self.width, self.height);
+        if let Some(blit) = cmd.blitCommandEncoder() {
+            // SAFETY: the buffer holds w * h * 4 bytes, the size of the copied texture.
+            unsafe {
+                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                    tex,
+                    0,
+                    0,
+                    MTLOrigin { x: 0, y: 0, z: 0 },
+                    MTLSize { width: w, height: h, depth: 1 },
+                    &self.readback,
+                    0,
+                    w * 4,
+                    w * h * 4,
+                );
+            }
+            blit.endEncoding();
+        }
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        let n = (w * h * 4).min(out.len());
+        // SAFETY: the shared buffer is w * h * 4 bytes and the GPU is done with it.
+        let src = unsafe { std::slice::from_raw_parts(self.readback.contents().as_ptr() as *const u8, n) };
+        out[..n].copy_from_slice(src);
+    }
+
+    // ------------------------------------------------------------- pen
+
+    pub fn pen_clear(&mut self) {
+        self.pen_ops.clear();
+        self.pen_ops.push(PenOp::Clear);
+        self.pen_copy = Some(Raster::new(self.width, self.height));
+    }
+
+    /// A line between device-pixel points with the given width and straight RGBA colour.
+    pub fn pen_line(&mut self, a: (f32, f32), b: (f32, f32), width: f32, rgba: [f32; 4]) {
+        let line = LineInstance { p: [a.0, a.1, b.0, b.1], color: rgba, misc: [width / 2.0, self.width as f32, self.height as f32, 0.0] };
+        match self.pen_ops.last_mut() {
+            Some(PenOp::Lines(lines)) => lines.push(line),
+            _ => self.pen_ops.push(PenOp::Lines(vec![line])),
+        }
+        self.pen_copy = None;
+    }
+
+    pub fn pen_stamp(&mut self, skin: &mut Skin, d: &Draw, scale: f64) {
+        if let Some(q) = self.quad(skin, d, scale) {
+            self.pen_ops.push(PenOp::Stamp(q));
+            self.pen_copy = None;
+        }
+    }
+
+    /// Encode pending pen operations into `cmd`; instance buffers go to `keep`
+    /// (they must live until the command buffer has run).
+    fn encode_pen(&mut self, cmd: &ProtocolObject<dyn MTLCommandBuffer>, keep: &mut Vec<Buf>) {
+        for op in std::mem::take(&mut self.pen_ops) {
+            let desc = pass(&self.pen, matches!(op, PenOp::Clear).then_some([0.0; 4]));
+            let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) else { continue };
+            match &op {
+                PenOp::Clear => {}
+                PenOp::Lines(lines) => {
+                    let bytes = std::mem::size_of_val(lines.as_slice());
+                    // SAFETY: `lines` is `bytes` long; Metal copies it into the new buffer.
+                    let buf = unsafe {
+                        self.device.newBufferWithBytes_length_options(NonNull::new_unchecked(lines.as_ptr() as *mut c_void), bytes, MTLResourceOptions::StorageModeShared)
+                    };
+                    if let Some(buf) = buf {
+                        enc.setRenderPipelineState(&self.line);
+                        // SAFETY: the buffer holds `lines.len()` `Line` structs.
+                        unsafe {
+                            enc.setVertexBuffer_offset_atIndex(Some(&buf), 0, 0);
+                            enc.drawPrimitives_vertexStart_vertexCount_instanceCount(MTLPrimitiveType::TriangleStrip, 0, 4, lines.len());
+                        }
+                        keep.push(buf);
+                    }
+                }
+                PenOp::Stamp(q) => self.draw_quad(&enc, q),
+            }
+            enc.endEncoding();
+        }
+    }
+
+    /// The pen layer as premultiplied RGBA (for `touching color`); reads it
+    /// back from the GPU when it changed.
+    pub fn pen_pixels(&mut self) -> &Raster {
+        if self.pen_copy.is_none() {
+            let mut r = Raster::new(self.width, self.height);
+            if let Some(cmd) = self.queue.commandBuffer() {
+                let mut keep = Vec::new();
+                self.encode_pen(&cmd, &mut keep);
+                let pen = self.pen.clone();
+                self.read_into(&cmd, &pen, &mut r.data);
+            }
+            self.pen_copy = Some(r);
+        }
+        self.pen_copy.as_ref().expect("pen copy")
+    }
+}

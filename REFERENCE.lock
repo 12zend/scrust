@@ -1,0 +1,4 @@
+# 参照実装の固定コミット（PRODUCT.md §0-3）。挙動の議論はこのコミット基準で行う。
+scratchfoundation/scratch-vm     develop  b3266a0cfe5122f20b72ccd738a3dd4dff4fc5a5
+TurboWarp/scratch-vm             develop  042235b193547c21540d5d6db2798bb7913a1df2
+scratchfoundation/scratch-render develop  adb5a09344ce690a314c4a1f338b270a2bb28e05

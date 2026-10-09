@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["conformance", "target"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+scrust-value = { path = "crates/scrust-value" }
+scrust-sb3 = { path = "crates/scrust-sb3" }
+scrust-ir = { path = "crates/scrust-ir" }
+scrust-analysis = { path = "crates/scrust-analysis" }
+scrust-codegen = { path = "crates/scrust-codegen" }
+scrust-runtime = { path = "crates/scrust-runtime" }
+scrust-render = { path = "crates/scrust-render" }
+scrust-node = { path = "crates/scrust-node" }
+scrust-audio = { path = "crates/scrust-audio" }
+scrust-player = { path = "crates/scrust-player" }
+libm = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+debug = false

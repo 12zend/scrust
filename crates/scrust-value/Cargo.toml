@@ -1,0 +1,9 @@
+[package]
+name = "scrust-value"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scratch 3 value model: JS-compatible strings, casts, comparison and math"
+
+[dependencies]
+libm.workspace = true

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scrust</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1e1e24; color: #e8e8ee; font: 14px system-ui, sans-serif; }
+  main { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 12px; box-sizing: border-box; }
+  canvas { width: min(96vw, calc((100vh - 90px) * 4 / 3)); max-width: 960px; aspect-ratio: 4 / 3; background: #fff; border-radius: 8px; outline: none; touch-action: none; }
+  .bar { display: flex; gap: 8px; align-items: center; }
+  button { border: 0; border-radius: 6px; padding: 6px 14px; font: inherit; cursor: pointer; color: #fff; }
+  #flag { background: #2e9e4f; } #stop { background: #d0453a; }
+  #status { opacity: 0.7; }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar"><button id="flag" title="Green flag">&#9873; Start</button><button id="stop" title="Stop">&#9632; Stop</button><span id="status">loading…</span></div>
+  <canvas id="stage" tabindex="0"></canvas>
+</main>
+<script>
+(async () => {
+  const WASM_URL = "__WASM__";
+  const WASM_BASE64 = "__WASM_BASE64__";
+  const status = document.getElementById('status');
+  const canvas = document.getElementById('stage');
+  let ex = null;
+  let audioCtx = null;
+  const decoded = new Map();   // "sprite/sound" -> Promise<AudioBuffer>
+  const playing = new Map();   // id -> {source, gain, pan}
+
+  const ensureAudio = () => {
+    if (!audioCtx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) audioCtx = new AC(); }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  };
+  const soundBuffer = (sprite, sound) => {
+    const key = sprite + '/' + sound;
+    if (!decoded.has(key)) {
+      const ptr = ex.scrust_sound_ptr(sprite, sound);
+      const len = ex.scrust_sound_len(sprite, sound);
+      const bytes = new Uint8Array(ex.memory.buffer, ptr, len).slice().buffer;
+      decoded.set(key, new Promise((resolve, reject) => audioCtx.decodeAudioData(bytes, resolve, reject)).catch(() => null));
+    }
+    return decoded.get(key);
+  };
+  const env = {
+    js_sound_play (id, sprite, sound, volume, rate, pan) {
+      const ctx = ensureAudio();
+      if (!ctx) { queueMicrotask(() => ex.scrust_sound_done(id)); return; }
+      const entry = {source: null, gain: ctx.createGain(), pan: ctx.createStereoPanner ? ctx.createStereoPanner() : null, stopped: false, rate};
+      entry.gain.gain.value = volume;
+      if (entry.pan) { entry.pan.pan.value = pan; entry.gain.connect(entry.pan); entry.pan.connect(ctx.destination); } else entry.gain.connect(ctx.destination);
+      playing.set(id, entry);
+      soundBuffer(sprite, sound).then(buffer => {
+        if (entry.stopped || !buffer) { playing.delete(id); ex.scrust_sound_done(id); return; }
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.playbackRate.value = entry.rate;
+        src.connect(entry.gain);
+        src.onended = () => { if (playing.get(id) === entry) { playing.delete(id); ex.scrust_sound_done(id); } };
+        entry.source = src;
+        src.start();
+      });
+    },
+    js_sound_stop (id) {
+      const e = playing.get(id);
+      if (!e) return;
+      e.stopped = true;
+      playing.delete(id);
+      if (e.source) { e.source.onended = null; try { e.source.stop(); } catch (err) { /* already stopped */ } }
+    },
+    js_sound_set (id, volume, rate, pan) {
+      const e = playing.get(id);
+      if (!e) return;
+      e.gain.gain.value = volume;
+      e.rate = rate;
+      if (e.source) e.source.playbackRate.value = rate;
+      if (e.pan) e.pan.pan.value = pan;
+    }
+  };
+
+  let bytes;
+  if (WASM_BASE64.length > 20) {
+    const bin = atob(WASM_BASE64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } else {
+    bytes = await (await fetch(WASM_URL)).arrayBuffer();
+  }
+  const {instance} = await WebAssembly.instantiate(bytes, {env});
+  ex = instance.exports;
+
+  const scale = Math.min(3, Math.max(1, Math.round(window.devicePixelRatio || 1) * 2)) / 1;
+  ex.scrust_init(scale, (Math.random() * 4294967296) >>> 0, Date.now() - performance.now(), -new Date().getTimezoneOffset());
+  const width = ex.scrust_width();
+  const height = ex.scrust_height();
+  canvas.width = width;
+  canvas.height = height;
+  const ctx2d = canvas.getContext('2d');
+  status.textContent = '';
+
+  const encoder = new TextEncoder();
+  const sendKey = (e, down) => {
+    const data = encoder.encode(e.key);
+    const ptr = ex.scrust_buffer(data.length);
+    new Uint8Array(ex.memory.buffer, ptr, data.length).set(data);
+    ex.scrust_key(data.length, down ? 1 : 0);
+    if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Backspace', 'Enter'].includes(e.key)) e.preventDefault();
+  };
+  canvas.addEventListener('keydown', e => { ensureAudio(); sendKey(e, true); });
+  canvas.addEventListener('keyup', e => sendKey(e, false));
+  const pos = e => {
+    const r = canvas.getBoundingClientRect();
+    return [480 * ((e.clientX - r.left) / r.width - 0.5), -360 * ((e.clientY - r.top) / r.height - 0.5)];
+  };
+  canvas.addEventListener('pointermove', e => { const [x, y] = pos(e); ex.scrust_mouse_move(x, y); });
+  canvas.addEventListener('pointerdown', e => { ensureAudio(); canvas.focus(); const [x, y] = pos(e); ex.scrust_mouse_move(x, y); ex.scrust_mouse_button(x, y, 1); });
+  window.addEventListener('pointerup', e => { const [x, y] = pos(e); ex.scrust_mouse_button(x, y, 0); });
+  document.getElementById('flag').addEventListener('click', () => { ensureAudio(); ex.scrust_green_flag(); canvas.focus(); });
+  document.getElementById('stop').addEventListener('click', () => ex.scrust_stop());
+  canvas.focus();
+
+  const frame = () => {
+    if (ex.scrust_frame(performance.now())) {
+      const view = new Uint8ClampedArray(ex.memory.buffer, ex.scrust_frame_ptr(), width * height * 4);
+      ctx2d.putImageData(new ImageData(view, width, height), 0, 0);
+    }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+})().catch(e => { document.getElementById('status').textContent = 'failed to start: ' + e; });
+</script>
+</body>
+</html>
