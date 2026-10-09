@@ -14,7 +14,7 @@ npm install
 npm run setup
 ```
 
-`setup` fetches scratch-gui at the pinned commit into `vendor/`, installs its dependencies and runs `build` (the `scrust` CLI, the renderer addon `crates/scrust-node`, and the webpack bundle in `build/`).
+`setup` installs the dependencies of the vendored scratch-gui (`vendor/scratch-gui`, checked in; upstream commit noted in `scripts/setup.js`) and runs `build` (the `scrust` CLI, the renderer addon `crates/scrust-node`, and the webpack bundle in `build/`).
 
 ```bash
 npm start

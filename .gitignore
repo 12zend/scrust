@@ -4,5 +4,4 @@
 node_modules
 *.log
 .DS_Store
-/gui/vendor
 /gui/build
