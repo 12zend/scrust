@@ -21,17 +21,19 @@ pub fn main(program: ProgramDef, defaults: Options) {
     let mut scale = 2.0;
     let mut screenshot: Option<String> = None;
     let mut embed = false;
+    let mut frames_shm: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--scale" => scale = it.next().and_then(|v| v.parse().ok()).unwrap_or(2.0),
             "--screenshot" => screenshot = it.next().cloned(),
             "--embed" => embed = true,
+            "--frames-shm" => frames_shm = it.next().cloned(),
             _ => {}
         }
     }
     if embed {
-        crate::embed::main(program, args, scale);
+        crate::embed::main(program, args, scale, frames_shm);
         return;
     }
     if args.trace.is_some() || screenshot.is_some() || args.frames.is_some() {
@@ -45,7 +47,7 @@ pub fn main(program: ProgramDef, defaults: Options) {
     world.audio = RodioAudio::new(program).map(|a| Box::new(a) as Box<dyn scrust_runtime::Audio>);
     let step = Duration::from_secs_f64(1.0 / args.options.fps);
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = App { program, world, scale, window: None, surface: None, context: None, step, next_tick: Instant::now(), mouse: (0.0, 0.0), started: false };
+    let mut app = App { program, world, scale, window: None, surface: None, context: None, metal: false, step, next_tick: Instant::now(), mouse: (0.0, 0.0), started: false };
     let _ = event_loop.run_app(&mut app);
 }
 
@@ -64,6 +66,10 @@ fn offscreen(program: &'static ProgramDef, args: Args, scale: f64, screenshot: O
     world.renderer = Some(Box::new(renderer));
     let frames = args.trace.or(args.frames).unwrap_or(1);
     let trace = args.trace.is_some();
+    if args.bench && !trace {
+        bench(&mut world, frames);
+        return;
+    }
     scrust_runtime::run_headless(&mut world, frames, |w| {
         if trace {
             println!("{}", w.trace_line());
@@ -88,6 +94,51 @@ fn offscreen(program: &'static ProgramDef, args: Args, scale: f64, screenshot: O
     }
 }
 
+/// `--frames N --bench`: run N frames as fast as possible, drawing each one,
+/// and report the time spent stepping the scripts and drawing.
+fn bench(world: &mut Box<World>, frames: u64) {
+    let started = Instant::now();
+    let wp: *mut World = &mut **world;
+    let (mut step_t, mut draw_t) = (Duration::ZERO, Duration::ZERO);
+    // SAFETY: the world is only accessed through `wp` from here on.
+    unsafe {
+        set_world_ptr(wp);
+        (*wp).green_flag();
+        for _ in 0..frames {
+            let t0 = Instant::now();
+            scrust_runtime::step(wp);
+            let t1 = Instant::now();
+            if let Some(mut r) = (*wp).renderer.take() {
+                if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
+                    sr.draw(&*wp);
+                }
+                (*wp).renderer = Some(r);
+            }
+            step_t += t1 - t0;
+            draw_t += t1.elapsed();
+        }
+    }
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    eprintln!(
+        "frames: {frames}  elapsed: {:.1} ms  step: {:.1} ms  draw: {:.1} ms  ({:.2} ms/frame)",
+        ms(started.elapsed()),
+        ms(step_t),
+        ms(draw_t),
+        ms(started.elapsed()) / frames.max(1) as f64
+    );
+}
+
+/// Let the renderer present into the window's view with Metal.
+fn attach_metal(window: &Window, renderer: &mut SoftRenderer) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else { return false };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else { return false };
+    let size = window.inner_size();
+    // SAFETY: winit's AppKit handle is the window's live content view, and
+    // `resumed` runs on the main thread.
+    unsafe { renderer.attach_view(h.ns_view.as_ptr(), size.width as usize, size.height as usize) }
+}
+
 struct App {
     program: &'static ProgramDef,
     world: Box<World>,
@@ -95,6 +146,9 @@ struct App {
     window: Option<Rc<Window>>,
     context: Option<softbuffer::Context<Rc<Window>>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    /// Frames go from the GPU straight to the window's Metal layer (no
+    /// readback, no softbuffer surface).
+    metal: bool,
     step: Duration,
     next_tick: Instant,
     /// Mouse position in Scratch coordinates.
@@ -104,6 +158,15 @@ struct App {
 
 impl App {
     fn present(&mut self) {
+        if self.metal {
+            if let Some(mut r) = self.world.renderer.take() {
+                if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
+                    sr.draw_to_view(&self.world);
+                }
+                self.world.renderer = Some(r);
+            }
+            return;
+        }
         let (Some(window), Some(_)) = (self.window.clone(), self.surface.as_ref()) else { return };
         // Draw with the renderer detached from the world (it reads the world).
         let Some(mut r) = self.world.renderer.take() else { return };
@@ -175,15 +238,19 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes().with_title("scrust").with_inner_size(LogicalSize::new(480.0 * self.scale, 360.0 * self.scale));
         let window = Rc::new(event_loop.create_window(attrs).expect("window"));
-        let context = softbuffer::Context::new(window.clone()).expect("display context");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
         // Render at the window's physical resolution.
         let physical = window.inner_size();
         let render_scale = (physical.width as f64 / 480.0).max(1.0);
-        self.world.renderer = Some(Box::new(SoftRenderer::new(self.program, render_scale)));
+        let mut renderer = SoftRenderer::new(self.program, render_scale);
+        self.metal = attach_metal(&window, &mut renderer);
+        if !self.metal {
+            let context = softbuffer::Context::new(window.clone()).expect("display context");
+            let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
+            self.context = Some(context);
+            self.surface = Some(surface);
+        }
+        self.world.renderer = Some(Box::new(renderer));
         self.window = Some(window);
-        self.context = Some(context);
-        self.surface = Some(surface);
         set_world_ptr(&mut *self.world);
         if !self.started {
             self.started = true;
@@ -197,6 +264,13 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.present(),
+            WindowEvent::Resized(size) if self.metal => {
+                if let Some(r) = self.world.renderer.as_mut() {
+                    if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
+                        sr.resize_view(size.width as usize, size.height as usize);
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let down = event.state == ElementState::Pressed;
                 let text = event.text.as_ref().map(|t| t.to_string());

@@ -144,7 +144,9 @@ class ScrustSession {
         this.host = host;
         this.hostKey = key;
         try {
-            await host.start({scale});
+            const sharedFrames = !!(renderer && renderer.canReadProgramFrames);
+            const {framesPath} = await host.start({scale, sharedFrames});
+            if (framesPath && renderer) renderer.watchProgramFrames(framesPath);
         } catch (e) {
             this.host = null;
             this.hostKey = null;

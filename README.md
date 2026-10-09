@@ -24,7 +24,7 @@ cargo build --release -p scrust-cli
 | `scrust check <in.sb3> [--types]` | unsupported blocks; storage types and procedure variants |
 | `scrust trace <in.sb3> --frames N` | deterministic headless run, JSON-lines trace |
 
-Options: `--fps N` (default 30), `--turbo`, `--warp-timer` / `--compat=strict`, `--deterministic --seed N`, `--no-unbox`, `--allow-unsupported`, `--headless`, `--max-passes N`, `--answers 'a|b'`. A built program accepts `--scale S`, `--frames N`, `--screenshot out.png`, `--trace N`, `--print-say`, `--bench`. On macOS it draws with Metal; `SCRUST_RENDERER=cpu` forces the CPU compositor (deterministic runs use it unless `SCRUST_RENDERER=metal`).
+Options: `--fps N` (default 30), `--turbo`, `--warp-timer` / `--compat=strict`, `--deterministic --seed N`, `--no-unbox`, `--allow-unsupported`, `--headless`, `--max-passes N`, `--answers 'a|b'`. A built program accepts `--scale S`, `--frames N`, `--screenshot out.png`, `--trace N`, `--print-say`, `--bench` (with `--frames N`: run N frames unthrottled, drawing each, and print the time spent in scripts and in drawing). On macOS it draws with Metal and presents straight from the GPU; `SCRUST_RENDERER=cpu` forces the CPU compositor (deterministic runs use it unless `SCRUST_RENDERER=metal`).
 
 ## GUI
 

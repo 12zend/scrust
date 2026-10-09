@@ -41,6 +41,7 @@ mod ffi {
             byte_offset: *mut usize,
         ) -> napi_status;
         pub fn napi_create_double(env: napi_env, value: f64, result: *mut napi_value) -> napi_status;
+        pub fn napi_create_buffer(env: napi_env, length: usize, data: *mut *mut c_void, result: *mut napi_value) -> napi_status;
         pub fn napi_create_buffer_copy(env: napi_env, length: usize, data: *const c_void, result_data: *mut *mut c_void, result: *mut napi_value) -> napi_status;
         pub fn napi_create_array_with_length(env: napi_env, length: usize, result: *mut napi_value) -> napi_status;
         pub fn napi_set_element(env: napi_env, object: napi_value, index: u32, value: napi_value) -> napi_status;
@@ -53,6 +54,47 @@ use ffi::{napi_callback_info, napi_env, napi_value};
 
 thread_local! {
     static SCENE: RefCell<Option<Scene>> = const { RefCell::new(None) };
+}
+
+// The shared frame file of the running program (`frame`), by path.
+#[cfg(unix)]
+thread_local! {
+    static FRAMES: RefCell<Option<(String, scrust_render::frames::FrameReader)>> = const { RefCell::new(None) };
+}
+
+/// `frame(path, seen)`: the program's latest frame if newer than frame number `seen`.
+#[cfg(unix)]
+fn read_frame(a: &Args) -> napi_value {
+    let path = a.string(0);
+    let seen = a.f64(1);
+    let seen = if seen.is_finite() && seen > 0.0 { seen as u64 } else { 0 };
+    FRAMES.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.as_ref().is_none_or(|(p, _)| *p != path) {
+            // The program creates the file when it starts; until then there is nothing to show.
+            *cell = scrust_render::frames::FrameReader::open(std::path::Path::new(&path)).map(|r| (path.clone(), r));
+        }
+        let Some((_, reader)) = cell.as_ref() else { return a.null() };
+        let mut buffer = ptr::null_mut();
+        let alloc = |len: usize| {
+            let mut data = ptr::null_mut();
+            // SAFETY: Node allocates a Buffer of `len` bytes and returns its storage.
+            let ok = unsafe { ffi::napi_create_buffer(a.env, len, &mut data, &mut buffer) } == ffi::OK;
+            (ok && !data.is_null()).then_some(data as *mut u8)
+        };
+        match reader.read(seen, alloc) {
+            Some((n, w, h)) => {
+                let items = [a.num(n as f64), a.num(w as f64), a.num(h as f64), buffer];
+                a.array(&items)
+            }
+            None => a.null(),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn read_frame(a: &Args) -> napi_value {
+    a.null()
 }
 
 fn with<R>(f: impl FnOnce(&mut Scene) -> R) -> R {
@@ -268,6 +310,10 @@ export! {
             a.buffer(&s.rgba)
         })
     };
+    // frame(path, seen) -> [frame number, width, height, Buffer of RGBA] | null:
+    // the running program's latest frame from its shared frame file (see
+    // scrust_render::frames), when it is newer than frame number `seen`.
+    frame => |a| read_frame(&a);
     // extract(id) -> [x, y, width, height, Buffer] (device pixels) | null
     extract => |a| match with(|s| s.extract(a.u32(0))) {
         Some(((x, y, w, h), data)) => {

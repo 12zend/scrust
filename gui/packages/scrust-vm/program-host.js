@@ -27,7 +27,8 @@ class ProgramHost {
 
     /**
      * Start the last compiled program; it receives the green flag at once.
-     * @param {{scale: number}} options
+     * @param {{scale: number, sharedFrames: boolean}} options
+     * @returns {Promise<{framesPath: ?string}>} the shared frame file, when asked for
      */
     async start (options) {
         if (!listening) {
@@ -37,7 +38,7 @@ class ProgramHost {
             });
         }
         current = this;
-        await this.bridge.start(options);
+        return (await this.bridge.start(options)) || {framesPath: null};
     }
 
     _handle (message) {

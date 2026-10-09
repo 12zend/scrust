@@ -49,6 +49,13 @@ const run = (cmd, args, options) => new Promise(resolve => {
 /** The running program: {child, sender, stderr}. */
 let program = null;
 
+let runs = 0;
+
+/** Remove a run's shared frame file (the page may still have it mapped; that is fine). */
+const removeFrames = file => {
+    if (file) fs.rm(file, {force: true}, () => {});
+};
+
 function stopProgram () {
     if (!program) return;
     const {child} = program;
@@ -64,26 +71,50 @@ function startProgram (sender, options) {
     stopProgram();
     const exe = programPath();
     if (!fs.existsSync(exe)) throw new Error('no compiled program');
-    const child = spawn(exe, ['--embed', '--scale', String(options.scale || 1)], {
+    const args = ['--embed', '--scale', String(options.scale || 1)];
+    // Frames go through a shared memory file that the page reads with the
+    // renderer addon (scrust_render::frames), when the page can; otherwise
+    // they are piped through this process.
+    const framesPath = options.sharedFrames ? path.join(workDir(), `frames-${process.pid}-${++runs}.bin`) : null;
+    if (framesPath) args.push('--frames-shm', framesPath);
+    const child = spawn(exe, args, {
         cwd: workDir(),
         stdio: ['pipe', 'pipe', 'pipe']
     });
-    const me = {child, sender, stderr: ''};
+    // frameBusy: a frame was sent to the page and not drawn yet (it answers
+    // 'scrust:frame-ack'); newer frames wait in nextFrame, replacing each
+    // other, so a slow page shows the latest picture instead of a backlog.
+    const me = {child, sender, stderr: '', frameBusy: false, nextFrame: null};
     program = me;
     const post = message => {
         if (!sender.isDestroyed()) sender.send('scrust:program', message);
     };
+    me.postFrame = frame => {
+        if (me.frameBusy) {
+            me.nextFrame = frame;
+            return;
+        }
+        me.frameBusy = true;
+        post(frame);
+    };
     // Messages are [tag u8][length u32 LE][payload]; see crates/scrust-player/src/embed.rs.
-    let pending = Buffer.alloc(0);
+    // Chunks are kept in a list and joined once a whole message is there
+    // (joining on every 64 KiB chunk copies a large frame dozens of times).
+    let chunks = [];
+    let buffered = 0;
+    let need = 5;
     child.stdout.on('data', chunk => {
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+        chunks.push(chunk);
+        buffered += chunk.length;
+        if (buffered < need) return;
+        let pending = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, buffered);
         while (pending.length >= 5) {
             const length = pending.readUInt32LE(1);
             if (pending.length < 5 + length) break;
             const tag = String.fromCharCode(pending[0]);
             const payload = pending.subarray(5, 5 + length);
             if (tag === 'F') {
-                post({type: 'frame', width: payload.readUInt32LE(0), height: payload.readUInt32LE(4), data: payload.subarray(8)});
+                me.postFrame({type: 'frame', width: payload.readUInt32LE(0), height: payload.readUInt32LE(4), data: payload.subarray(8)});
             } else if (tag === 'T') {
                 post({type: 'threads', count: payload.readUInt32LE(0)});
             } else if (tag === 'S') {
@@ -91,18 +122,23 @@ function startProgram (sender, options) {
             }
             pending = pending.subarray(5 + length);
         }
+        chunks = pending.length ? [pending] : [];
+        buffered = pending.length;
+        need = pending.length >= 5 ? 5 + pending.readUInt32LE(1) : 5;
     });
     child.stderr.on('data', d => {
         me.stderr = (me.stderr + d).slice(-4000);
     });
     child.stdin.on('error', () => {});
     child.on('exit', (code, signal) => {
+        removeFrames(framesPath);
         // A program replaced by a newer one is expected to go away.
         if (program === me) {
             program = null;
             post({type: 'exit', code, signal, log: me.stderr});
         }
     });
+    return {framesPath};
 }
 
 ipcMain.handle('scrust:start', (event, options) => startProgram(event.sender, options || {}));
@@ -110,6 +146,13 @@ ipcMain.on('scrust:input', (event, line) => {
     if (program && program.child.stdin.writable) program.child.stdin.write(`${line}\n`);
 });
 ipcMain.on('scrust:kill', () => stopProgram());
+ipcMain.on('scrust:frame-ack', () => {
+    if (!program) return;
+    program.frameBusy = false;
+    const frame = program.nextFrame;
+    program.nextFrame = null;
+    if (frame) program.postFrame(frame);
+});
 
 // ------------------------------------------------------------------ compiler
 

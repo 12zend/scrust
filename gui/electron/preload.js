@@ -29,13 +29,20 @@ contextBridge.exposeInMainWorld('scrustCompiler', {
      * @returns {Promise<{ok: boolean, warnings?: string, log: string}>}
      */
     compile: (sb3, options) => ipcRenderer.invoke('scrust:compile', sb3, options),
-    /** Start the last compiled program (it receives the green flag). */
+    /** Start the last compiled program (it receives the green flag); resolves to {framesPath}. */
     start: options => ipcRenderer.invoke('scrust:start', options),
     /** One input line for the program (see crates/scrust-player/src/embed.rs). */
     send: line => ipcRenderer.send('scrust:input', line),
     kill: () => ipcRenderer.send('scrust:kill'),
     /** Messages from the program: {type: 'frame'|'threads'|'state'|'exit', ...}. */
     onMessage: callback => {
-        ipcRenderer.on('scrust:program', (event, message) => callback(message));
+        ipcRenderer.on('scrust:program', (event, message) => {
+            try {
+                callback(message);
+            } finally {
+                // The main process sends the next frame once this one is drawn.
+                if (message.type === 'frame') ipcRenderer.send('scrust:frame-ack');
+            }
+        });
     }
 });

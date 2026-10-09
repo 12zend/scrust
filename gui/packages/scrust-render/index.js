@@ -87,6 +87,8 @@ class ScrustRender extends EventEmitter {
         this._mode = 'editor';
         this._programCanvas = null;
         this._lastFrame = null;
+        /** The shared frame file being shown ({path, seen}), see watchProgramFrames. */
+        this._frameWatch = null;
 
         this.overlayContainer = document.createElement('div');
         this.overlayContainer.className = 'scratch-render-overlays';
@@ -526,13 +528,44 @@ class ScrustRender extends EventEmitter {
     /** Switch between showing the editor scene and a running program's frames. */
     setProgramMode (enabled) {
         this._mode = enabled ? 'program' : 'editor';
-        if (!enabled) this._programCanvas = null;
+        if (!enabled) {
+            this._programCanvas = null;
+            this._frameWatch = null;
+        }
         this.dirty = true;
         this.draw();
     }
 
     get programMode () {
         return this._mode === 'program';
+    }
+
+    /** Whether a program's frames can be read from shared memory (watchProgramFrames). */
+    get canReadProgramFrames () {
+        return !!(native && native.frame);
+    }
+
+    /**
+     * Show the frames a program publishes in the shared memory file `path`
+     * (crates/scrust-render/src/frames.rs), checked once per animation frame,
+     * until another file is watched or program mode ends. Frames that
+     * arrive between two checks are skipped.
+     * @param {string} path the file passed to the program as --frames-shm
+     */
+    watchProgramFrames (path) {
+        const watch = {path, seen: 0};
+        this._frameWatch = watch;
+        const poll = () => {
+            if (this._frameWatch !== watch) return;
+            const frame = native.frame(path, watch.seen);
+            if (frame) {
+                const [number, width, height, rgba] = frame;
+                watch.seen = number;
+                this.showProgramFrame(rgba, width, height);
+            }
+            requestAnimationFrame(poll);
+        };
+        requestAnimationFrame(poll);
     }
 
     /** Show a frame (straight RGBA bytes, opaque) rendered by the compiled program. */

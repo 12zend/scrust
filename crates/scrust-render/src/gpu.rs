@@ -22,6 +22,8 @@ use objc2_metal::{
     MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLSize, MTLStorageMode,
     MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
+use objc2_core_foundation::CGSize;
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -248,9 +250,24 @@ pub(crate) struct Gpu {
     pen_ops: Vec<PenOp>,
     /// CPU copy of the pen layer (premultiplied), valid until the next pen operation.
     pen_copy: Option<Raster>,
+    /// Storage for sampled textures: shared on unified memory (no second copy).
+    storage: MTLStorageMode,
+    /// Layer of the window frames are presented to (`attach_view`).
+    layer: Option<Retained<CAMetalLayer>>,
+    /// Pipeline drawing the composed frame into the layer's BGRA drawable.
+    blit: Option<Pipeline>,
+    /// The last presented frame, still running on the GPU; waited for before
+    /// the CPU touches resources it may read (overlay uploads, readbacks).
+    in_flight: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Instance buffers used by `in_flight`.
+    in_flight_buffers: Vec<Buf>,
 }
 
 fn pipeline(device: &ProtocolObject<dyn MTLDevice>, lib: &ProtocolObject<dyn MTLLibrary>, vs: &str, fs: &str) -> Option<Pipeline> {
+    pipeline_with(device, lib, vs, fs, MTLPixelFormat::RGBA8Unorm, true)
+}
+
+fn pipeline_with(device: &ProtocolObject<dyn MTLDevice>, lib: &ProtocolObject<dyn MTLLibrary>, vs: &str, fs: &str, format: MTLPixelFormat, blend: bool) -> Option<Pipeline> {
     let desc = MTLRenderPipelineDescriptor::new();
     let vs = lib.newFunctionWithName(&NSString::from_str(vs))?;
     let fs = lib.newFunctionWithName(&NSString::from_str(fs))?;
@@ -258,8 +275,8 @@ fn pipeline(device: &ProtocolObject<dyn MTLDevice>, lib: &ProtocolObject<dyn MTL
     desc.setFragmentFunction(Some(&fs));
     // SAFETY: index 0 always exists.
     let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
-    att.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
-    att.setBlendingEnabled(true);
+    att.setPixelFormat(format);
+    att.setBlendingEnabled(blend);
     att.setSourceRGBBlendFactor(MTLBlendFactor::One);
     att.setSourceAlphaBlendFactor(MTLBlendFactor::One);
     att.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
@@ -277,6 +294,10 @@ fn sampler(device: &ProtocolObject<dyn MTLDevice>, filter: MTLSamplerMinMagFilte
 }
 
 fn texture(device: &ProtocolObject<dyn MTLDevice>, w: usize, h: usize, target: bool) -> Option<Tex> {
+    texture_in(device, w, h, target, MTLStorageMode::Managed)
+}
+
+fn texture_in(device: &ProtocolObject<dyn MTLDevice>, w: usize, h: usize, target: bool, storage: MTLStorageMode) -> Option<Tex> {
     // SAFETY: plain descriptor construction.
     let desc = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::RGBA8Unorm, w.max(1), h.max(1), false) };
     if target {
@@ -284,7 +305,7 @@ fn texture(device: &ProtocolObject<dyn MTLDevice>, w: usize, h: usize, target: b
         desc.setStorageMode(MTLStorageMode::Private);
     } else {
         desc.setUsage(MTLTextureUsage::ShaderRead);
-        desc.setStorageMode(MTLStorageMode::Managed);
+        desc.setStorageMode(storage);
     }
     device.newTextureWithDescriptor(&desc)
 }
@@ -349,6 +370,11 @@ impl Gpu {
             items: Vec::new(),
             pen_ops: vec![PenOp::Clear],
             pen_copy: None,
+            storage: if device.hasUnifiedMemory() { MTLStorageMode::Shared } else { MTLStorageMode::Managed },
+            layer: None,
+            blit: pipeline_with(&device, &lib, "rect_vs", "rect_fs", MTLPixelFormat::BGRA8Unorm, false),
+            in_flight: None,
+            in_flight_buffers: Vec::new(),
             device,
             queue,
         };
@@ -362,6 +388,7 @@ impl Gpu {
         if (w, h) == (self.width, self.height) {
             return true;
         }
+        self.settle();
         let (Some(target), Some(pen), Some(readback)) = (
             texture(&self.device, w, h, true),
             texture(&self.device, w, h, true),
@@ -384,7 +411,7 @@ impl Gpu {
             *used = frame;
             return Some((tex.clone(), raster.w, raster.h));
         }
-        let tex = texture(&self.device, raster.w, raster.h, false)?;
+        let tex = texture_in(&self.device, raster.w, raster.h, false, self.storage)?;
         upload(&tex, raster);
         self.skins.insert(key, (tex.clone(), frame));
         Some((tex, raster.w, raster.h))
@@ -411,8 +438,23 @@ impl Gpu {
 
     // ------------------------------------------------------------- frame
 
+    /// Upload a skin's texture ahead of its first use.
+    pub fn preload(&mut self, skin: &mut Skin) {
+        let _ = self.skin_texture(skin, 1.0);
+    }
+
+    /// Wait for the previously presented frame (see `in_flight`).
+    fn settle(&mut self) {
+        if let Some(cmd) = self.in_flight.take() {
+            cmd.waitUntilCompleted();
+        }
+        self.in_flight_buffers.clear();
+    }
+
     /// Start a frame over an opaque background colour.
     pub fn begin(&mut self, background: [u8; 3]) {
+        // Overlay textures of the last frame are rewritten below.
+        self.settle();
         self.frame_no += 1;
         self.background = background;
         self.items.clear();
@@ -449,9 +491,80 @@ impl Gpu {
     /// Render the frame and read it back as opaque RGBA into `out`
     /// (`width * height * 4` bytes).
     pub fn finish(&mut self, out: &mut [u8]) {
+        self.settle();
         let Some(cmd) = self.queue.commandBuffer() else { return };
+        let _keep = self.encode_frame(&cmd);
+        self.read_into(&cmd, &self.target, out);
+    }
+
+    /// Present the frame in the attached layer (`attach_view`) without
+    /// reading it back. The GPU finishes it while the CPU runs the next step.
+    pub fn present(&mut self) {
+        let (Some(layer), Some(blit)) = (self.layer.clone(), self.blit.clone()) else { return };
+        self.settle();
+        let Some(cmd) = self.queue.commandBuffer() else { return };
+        self.in_flight_buffers = self.encode_frame(&cmd);
+        if let Some(drawable) = layer.nextDrawable() {
+            let desc = pass(&drawable.texture(), Some([1.0; 4]));
+            if let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) {
+                enc.setRenderPipelineState(&blit);
+                let rect = [-1.0f32, 1.0, 1.0, -1.0];
+                // SAFETY: `rect` is the shader's `Rect` (one float4).
+                unsafe {
+                    enc.setVertexBytes_length_atIndex(NonNull::from(&rect).cast::<c_void>(), 16, 0);
+                    enc.setFragmentTexture_atIndex(Some(&self.target), 0);
+                    enc.setFragmentSamplerState_atIndex(Some(&self.linear), 0);
+                    enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+                }
+                enc.endEncoding();
+            }
+            cmd.presentDrawable(ProtocolObject::from_ref(&*drawable));
+        }
+        cmd.commit();
+        self.in_flight = Some(cmd);
+    }
+
+    /// Present frames in a CAMetalLayer installed as the backing layer of
+    /// `ns_view` (an `NSView*`), with a drawable of `width` x `height` pixels.
+    ///
+    /// # Safety
+    /// `ns_view` must be a live `NSView` and this must run on the main thread.
+    pub unsafe fn attach_view(&mut self, ns_view: *mut c_void, width: usize, height: usize) -> bool {
+        let Some(view) = (ns_view as *mut objc2::runtime::AnyObject).as_ref() else { return false };
+        if self.blit.is_none() {
+            return false;
+        }
+        let layer = CAMetalLayer::new();
+        layer.setDevice(Some(&self.device));
+        layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        layer.setFramebufferOnly(true);
+        layer.setDrawableSize(CGSize { width: width as f64, height: height as f64 });
+        let _: () = objc2::msg_send![view, setWantsLayer: true];
+        let _: () = objc2::msg_send![view, setLayer: &*layer];
+        let scale: f64 = match objc2::msg_send![view, window] {
+            Some(window) => {
+                let window: &objc2::runtime::AnyObject = window;
+                objc2::msg_send![window, backingScaleFactor]
+            }
+            None => 1.0,
+        };
+        layer.setContentsScale(scale);
+        self.layer = Some(layer);
+        true
+    }
+
+    /// Change the size of the attached layer's drawables (window resize).
+    pub fn set_drawable_size(&mut self, width: usize, height: usize) {
+        if let Some(layer) = &self.layer {
+            layer.setDrawableSize(CGSize { width: width.max(1) as f64, height: height.max(1) as f64 });
+        }
+    }
+
+    /// Pen operations and the frame's items into `cmd`, rendering into
+    /// `target`; returns the buffers that must live until `cmd` has run.
+    fn encode_frame(&mut self, cmd: &ProtocolObject<dyn MTLCommandBuffer>) -> Vec<Buf> {
         let mut keep: Vec<Buf> = Vec::new();
-        self.encode_pen(&cmd, &mut keep);
+        self.encode_pen(cmd, &mut keep);
         let bg = self.background;
         let desc = pass(&self.target, Some([bg[0] as f64 / 255.0, bg[1] as f64 / 255.0, bg[2] as f64 / 255.0, 1.0]));
         if let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) {
@@ -464,10 +577,10 @@ impl Gpu {
             enc.endEncoding();
         }
         self.items.clear();
-        self.read_into(&cmd, &self.target, out);
         // Forget skin textures that have not been drawn for a while.
         let frame = self.frame_no;
         self.skins.retain(|_, (_, used)| frame - *used < 300);
+        keep
     }
 
     fn draw_quad(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, q: &Quad) {
@@ -550,11 +663,22 @@ impl Gpu {
 
     /// Encode pending pen operations into `cmd`; instance buffers go to `keep`
     /// (they must live until the command buffer has run).
+    ///
+    /// All of them go into one render pass: a pass loads and stores the whole
+    /// pen texture, so a pass per stamp costs a full-screen copy per stamp
+    /// (projects that stamp thousands of times per frame were GPU-bound on
+    /// that alone). A clear can only be the first operation (`pen_clear`
+    /// drops everything before it) and becomes the pass's load action.
     fn encode_pen(&mut self, cmd: &ProtocolObject<dyn MTLCommandBuffer>, keep: &mut Vec<Buf>) {
-        for op in std::mem::take(&mut self.pen_ops) {
-            let desc = pass(&self.pen, matches!(op, PenOp::Clear).then_some([0.0; 4]));
-            let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) else { continue };
-            match &op {
+        let ops = std::mem::take(&mut self.pen_ops);
+        if ops.is_empty() {
+            return;
+        }
+        let clear = matches!(ops.first(), Some(PenOp::Clear));
+        let desc = pass(&self.pen, clear.then_some([0.0; 4]));
+        let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) else { return };
+        for op in &ops {
+            match op {
                 PenOp::Clear => {}
                 PenOp::Lines(lines) => {
                     let bytes = std::mem::size_of_val(lines.as_slice());
@@ -574,8 +698,8 @@ impl Gpu {
                 }
                 PenOp::Stamp(q) => self.draw_quad(&enc, q),
             }
-            enc.endEncoding();
         }
+        enc.endEncoding();
     }
 
     /// The pen layer as premultiplied RGBA (for `touching color`); reads it

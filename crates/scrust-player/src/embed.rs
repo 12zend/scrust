@@ -11,9 +11,13 @@
 //! End of input ends the program.
 //!
 //! stdout, binary messages `[tag: u8][length: u32 LE][payload]`:
-//!   `F` frame: width u32 LE, height u32 LE, RGBA pixels (only when the picture changed)
+//!   `F` frame: width u32 LE, height u32 LE, RGBA pixels (only when the picture
+//!       changed, and only without `--frames-shm`)
 //!   `T` number of running threads, u32 LE (when it changes)
 //!   `S` state JSON (`crate::state`), on request and whenever the program goes idle
+//!
+//! With `--frames-shm PATH` frames are published in a shared memory file
+//! instead (`scrust_render::frames`), which the GUI's renderer addon reads.
 
 use crate::audio::RodioAudio;
 use crate::input::key_event;
@@ -62,13 +66,31 @@ fn send(out: &mut impl Write, tag: u8, parts: &[&[u8]]) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn main(program: &'static ProgramDef, args: Args, scale: f64) {
+/// Where frames go: the stdout pipe or a shared memory file.
+enum FrameSink {
+    Pipe { last: Vec<u8> },
+    #[cfg(unix)]
+    Shared(scrust_render::frames::FrameWriter),
+}
+
+pub fn main(program: &'static ProgramDef, args: Args, scale: f64, frames_shm: Option<String>) {
     let mut world = World::new(program, args.options.clone());
     install_native_clock(&mut world);
     world.current_msecs = world.clock_ms();
     world.timer_start = world.current_msecs;
     world.audio = RodioAudio::new(program).map(|a| Box::new(a) as Box<dyn scrust_runtime::Audio>);
-    world.renderer = Some(Box::new(SoftRenderer::new(program, scale.clamp(0.25, 4.0))));
+    let renderer = SoftRenderer::new(program, scale.clamp(0.25, 4.0));
+    let mut sink = FrameSink::Pipe { last: Vec::new() };
+    #[cfg(unix)]
+    if let Some(path) = frames_shm {
+        match scrust_render::frames::FrameWriter::create(std::path::Path::new(&path), renderer.width * renderer.height * 4) {
+            Ok(w) => sink = FrameSink::Shared(w),
+            Err(e) => eprintln!("scrust: cannot share frames through {path}: {e}; sending them on stdout"),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = frames_shm;
+    world.renderer = Some(Box::new(renderer));
 
     let (tx, rx) = mpsc::channel::<Cmd>();
     std::thread::spawn(move || {
@@ -91,8 +113,6 @@ pub fn main(program: &'static ProgramDef, args: Args, scale: f64) {
     let step = Duration::from_secs_f64(1.0 / args.options.fps);
     let mut next_tick = Instant::now();
     let mut last_threads: Option<u32> = None;
-    let mut last_frame: Vec<u8> = Vec::new();
-    let mut rgba: Vec<u8> = Vec::new();
     loop {
         let wait = next_tick.saturating_duration_since(Instant::now());
         let mut cmds = Vec::new();
@@ -130,17 +150,24 @@ pub fn main(program: &'static ProgramDef, args: Args, scale: f64) {
             let Some(mut r) = world.renderer.take() else { return };
             if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
                 sr.draw(&world);
-                rgba.clear();
-                rgba.reserve(sr.frame.len() * 4);
-                for p in &sr.frame {
-                    rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
-                }
-                if rgba != last_frame {
-                    let dims = [(sr.width as u32).to_le_bytes(), (sr.height as u32).to_le_bytes()].concat();
-                    if send(&mut out, b'F', &[&dims, &rgba]).is_err() {
-                        return;
+                let (fw, fh, rgba) = (sr.width as u32, sr.height as u32, sr.rgba());
+                match &mut sink {
+                    FrameSink::Pipe { last } => {
+                        if rgba != last.as_slice() {
+                            let dims = [fw.to_le_bytes(), fh.to_le_bytes()].concat();
+                            if send(&mut out, b'F', &[&dims, rgba]).is_err() {
+                                return;
+                            }
+                            last.clear();
+                            last.extend_from_slice(rgba);
+                        }
                     }
-                    std::mem::swap(&mut rgba, &mut last_frame);
+                    #[cfg(unix)]
+                    FrameSink::Shared(w) => {
+                        if !w.is_latest(fw, fh, rgba) {
+                            w.publish(fw, fh, rgba);
+                        }
+                    }
                 }
             }
             world.renderer = Some(r);

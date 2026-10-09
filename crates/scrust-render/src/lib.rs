@@ -4,6 +4,8 @@
 //! `touching ...` blocks see exactly what is drawn (scratch-render likewise
 //! answers them on the CPU from its silhouettes).
 
+#[cfg(unix)]
+pub mod frames;
 #[cfg(target_os = "macos")]
 mod gpu;
 pub mod scene;
@@ -50,6 +52,18 @@ mod gpu {
             match *self {}
         }
         pub fn pen_pixels(&mut self) -> &Raster {
+            match *self {}
+        }
+        pub fn preload(&mut self, _skin: &mut Skin) {
+            match *self {}
+        }
+        pub fn present(&mut self) {
+            match *self {}
+        }
+        pub unsafe fn attach_view(&mut self, _ns_view: *mut std::ffi::c_void, _width: usize, _height: usize) -> bool {
+            match *self {}
+        }
+        pub fn set_drawable_size(&mut self, _width: usize, _height: usize) {
             match *self {}
         }
     }
@@ -538,7 +552,42 @@ impl SoftRenderer {
     pub fn new(program: &'static ProgramDef, scale: f64) -> SoftRenderer {
         let mut r = Self::new_cpu(program, scale);
         r.gpu = Gpu::new(r.width, r.height);
+        r.preload();
         r
+    }
+
+    /// Decode every costume up front, in parallel, and upload bitmaps to the
+    /// GPU, as Scratch does when it loads a project. Decoding on first use
+    /// stalls the frame that first shows a costume, which projects that
+    /// cycle through thousands of costumes do on almost every frame.
+    fn preload(&mut self) {
+        let jobs: Vec<(usize, usize)> = (self.skins.iter().enumerate())
+            .flat_map(|(s, cs)| cs.iter().enumerate().filter(|(_, c)| c.is_none()).map(move |(c, _)| (s, c)))
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(jobs.len());
+        let (program, opt) = (self.program, &self.opt);
+        let load = |&(s, c): &(usize, usize)| {
+            let def = &program.sprites[s].costumes[c];
+            ((s, c), Skin::load(def.data, def.data_format, def.bitmap_resolution, (def.center_x, def.center_y), opt))
+        };
+        let loaded: Vec<((usize, usize), Skin)> = if threads <= 1 {
+            jobs.iter().map(load).collect()
+        } else {
+            let chunk = jobs.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs.chunks(chunk).map(|part| scope.spawn(move || part.iter().map(load).collect::<Vec<_>>())).collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            })
+        };
+        for ((s, c), mut skin) in loaded {
+            if let (Some(gpu), skin::SkinKind::Bitmap) = (self.gpu.as_mut(), &skin.kind) {
+                gpu.preload(&mut skin);
+            }
+            self.skins[s][c] = Some(skin);
+        }
     }
 
     /// A renderer that draws everything on the CPU (deterministic output).
@@ -742,8 +791,51 @@ impl SoftRenderer {
         self.canvas = canvas;
     }
 
+    /// Present frames straight from the GPU into the window whose `NSView*`
+    /// is `ns_view` (`width` x `height` device pixels), instead of reading
+    /// them back for `frame`. False when there is no GPU (draw with `draw`).
+    ///
+    /// # Safety
+    /// `ns_view` must be a live `NSView` and this must run on the main thread.
+    pub unsafe fn attach_view(&mut self, ns_view: *mut std::ffi::c_void, width: usize, height: usize) -> bool {
+        match self.gpu.as_mut() {
+            Some(gpu) => gpu.attach_view(ns_view, width, height),
+            None => false,
+        }
+    }
+
+    /// The attached window changed size (device pixels).
+    pub fn resize_view(&mut self, width: usize, height: usize) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_drawable_size(width, height);
+        }
+    }
+
+    /// Render the stage and present it in the attached view (`attach_view`).
+    pub fn draw_to_view(&mut self, w: &World) {
+        if let Some(mut gpu) = self.gpu.take() {
+            self.compose_gpu(w, &mut gpu);
+            gpu.present();
+            self.gpu = Some(gpu);
+        }
+    }
+
+    /// The last frame drawn by `draw`, as opaque RGBA.
+    pub fn rgba(&self) -> &[u8] {
+        &self.canvas.data
+    }
+
     /// The same frame composited by the GPU.
     fn draw_gpu(&mut self, w: &World, gpu: &mut Gpu) {
+        self.compose_gpu(w, gpu);
+        let mut canvas = std::mem::replace(&mut self.canvas, Raster::new(0, 0));
+        gpu.finish(&mut canvas.data);
+        self.present(&canvas);
+        self.canvas = canvas;
+    }
+
+    /// Queue the stage, the drawables and the overlays on the GPU.
+    fn compose_gpu(&mut self, w: &World, gpu: &mut Gpu) {
         let s = self.scale;
         gpu.begin([255, 255, 255]);
         if let Some(d) = self.draw_info(w.target(w.order[0])) {
@@ -763,10 +855,6 @@ impl SoftRenderer {
         }
         let mut out = Overlays::Gpu(gpu);
         self.draw_overlays(w, &mut out);
-        let mut canvas = std::mem::replace(&mut self.canvas, Raster::new(0, 0));
-        gpu.finish(&mut canvas.data);
-        self.present(&canvas);
-        self.canvas = canvas;
     }
 
     fn draw_overlays(&mut self, w: &World, out: &mut Overlays) {
