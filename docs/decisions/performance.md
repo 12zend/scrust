@@ -17,6 +17,8 @@
 | Comparisons with constants and string variables building `Value`s | `compare_lit`, `compare_val_str`, `compare_str_ci_lit`, and `letter_eq_ci` for `(letter i of s) = "c"` |
 | String constants behind a thread-local (a function call per use on macOS) | `jstr!` constants are lazily filled statics: only the script thread evaluates them |
 | Canonical strings like `"0.5"` kept variables boxed when shown by `say` or a monitor | the lattice distinguishes fractions of at most two digits (`str:fract2`): `say` rounds to two decimals and monitors to six, so they show exactly like their numbers |
+| `"Infinity"` (z-buffer initial values) and lists read by `(list contents)` kept storage boxed | `"Infinity"` / `"-Infinity"` are canonical (`str:inf`); `listContents` only looks at string forms, so it is not a kind-sensitive sink (see `kind-sensitivity.md`) |
+| `cos(90)` is CORE-MATH's slowest case; `%` called C `fmod` | exact fast paths, see `math-libm.md` |
 | Variable storage reached through raw pointers that may alias anything, so LLVM reloads every variable after every store and call | synchronous procedures whose bodies cannot reach their storage through the world (no `(var) of (this sprite or the stage)`, no dynamic `(property) of`, no `create clone`, transitively) receive it as `&mut` parameters (`*_na` functions); `SCRUST_ALIASED_STORAGE=1` turns this off |
 
 Build settings were measured too: fat LTO with one codegen unit, or thin LTO, changed nothing beyond noise (±3 %), so the generated crate keeps `opt-level = 3`, 16 codegen units and no LTO.
@@ -25,8 +27,10 @@ Build settings were measured too: fat LTO with one codegen unit, or thin LTO, ch
 
 | | native | wasm |
 |---|---|---|
-| before | 0.76× | 0.58× |
-| after | see the commit introducing this file | |
+| a7749fc (before) | 0.76× | 0.58× |
+| now (min of two runs per engine, 22 projects with TurboWarp > 20 ms) | 1.86× | 1.32× |
+
+Per project, native: 3.4–4.5× on Bob-omb 3D, Greedy meshing, Tipsify Sort and Zend Space, about 2× on FLOW, Goopy, Planet Gen, reflections, Image Editor and the BSP rasterizer, 1.2–1.8× on the other raycasters and simulations, and parity on sub-millisecond frames (Mandelbrot, Conway).
 
 Per project the range is wide: string- and list-heavy projects (texture loaders, tokenizers, emulators) gain the most, numeric loops the least, because V8 compiles those to code close to LLVM's and both spend the same time in correctly rounded `sin`/`cos` (CORE-MATH natively; V8 calls LLVM libc).
 

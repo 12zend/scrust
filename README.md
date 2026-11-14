@@ -53,7 +53,7 @@ Options: `--fps N` (default 30), `--turbo`, `--warp-timer` / `--compat=strict`, 
 |---|---|
 | 0 values | done: spec table, 10 M random `Number()`/`String()` cases identical to Node |
 | 1 front end, scheduler, headless | done: traces identical to scratch-vm on the conformance suite (control, operators, data, events, procedures, clones, motion/looks state) |
-| 2 type inference, unboxing | done: storage + flow types, kind-sensitivity, sync/async variants; `--no-unbox` and unboxed runs agree; 1.1×–6.4× faster than TurboWarp on the bundled benchmarks |
+| 2 type inference, unboxing | done: storage + flow types, kind-sensitivity, sync/async variants; `--no-unbox` and unboxed runs agree; on 22 heavy real projects scripts run 1.86× (native) and 1.32× (wasm) faster than TurboWarp (geometric mean, `conformance/bench/real.js`, see [performance.md](docs/decisions/performance.md)) |
 | 3 rendering, input | working; fencing, size clamping and the `touching` blocks match scratch-render on the golden test (`conformance/render`, 78/78); drawing on the GPU with Metal on macOS (sprites, effects, pen), CPU compositor elsewhere and for collisions; no pixel-level comparison with scratch-render |
 | 4 pen, sound | working (pen, WAV/MP3 playback, pitch/pan/volume); no pixel or timing comparison with the reference |
 | 5 wasm | working: `--target wasm`, `--single-html` |

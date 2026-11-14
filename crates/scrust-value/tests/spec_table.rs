@@ -263,11 +263,12 @@ fn booleans() {
 #[test]
 fn is_int_cases() {
     assert!(is_int(&n(f64::NAN)));
-    assert!(!is_int(&n(1e21)));
+    // TurboWarp: `val === Math.floor(val)` (vanilla's parseInt rejected these two).
+    assert!(is_int(&n(1e21)));
     assert!(!is_int(&n(1.5)));
     assert!(is_int(&n(-0.0)));
     assert!(is_int(&n(1e20)));
-    assert!(!is_int(&n(f64::INFINITY)));
+    assert!(is_int(&n(f64::INFINITY)));
     assert!(is_int(&Value::Bool(true)));
     assert!(is_int(&s("abc")));
     assert!(is_int(&s("1e5")));

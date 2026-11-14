@@ -305,9 +305,9 @@ impl Analysis {
                 _ => {}
             });
             walk_exprs(body, &mut |e| match e {
-                Expr::ListContents(l) => {
-                    kind.insert(Node::List(*l));
-                }
+                // `(list contents)` looks only at each item's string form
+                // (TurboWarp's `listContents`), the same for a canonical
+                // numeric string and its number: not a kind-sensitive sink.
                 Expr::Rep(Rep::KeyPressed, args) => kind.extend(args.iter().flat_map(|a| Self::raw_sources(a, owner))),
                 Expr::Rep(Rep::AttrOf, args) => {
                     // A dynamic `(property) of (object)`: any variable with that name may be read raw.

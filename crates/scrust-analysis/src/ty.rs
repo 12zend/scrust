@@ -34,6 +34,9 @@ impl Ty {
     /// Canonical numeric string with a one or two digit fraction (`"1.5"`,
     /// `"-0.25"`): shown exactly like its number everywhere.
     pub const STR_CSHORT: Ty = Ty(1 << 16);
+    /// `"Infinity"` / `"-Infinity"`: `String(Number(s)) === s`, and every
+    /// block treats them like the numbers (`isInt`, list indices, display).
+    pub const STR_CINF: Ty = Ty(1 << 17);
 
     pub const INF: Ty = Ty(Self::POS_INF.0 | Self::NEG_INF.0);
     pub const FRACT: Ty = Ty(Self::POS_FRACT.0 | Self::NEG_FRACT.0);
@@ -43,7 +46,7 @@ impl Ty {
     /// Every number except NaN.
     pub const NUMBER: Ty = Ty(Self::FINITE.0 | Self::INF.0);
     pub const NUMBER_OR_NAN: Ty = Ty(Self::NUMBER.0 | Self::NAN.0);
-    pub const STR_CANON: Ty = Ty(Self::STR_CINT.0 | Self::STR_CFRACT.0 | Self::STR_CSHORT.0);
+    pub const STR_CANON: Ty = Ty(Self::STR_CINT.0 | Self::STR_CFRACT.0 | Self::STR_CSHORT.0 | Self::STR_CINF.0);
     pub const STRING: Ty = Ty(Self::STR_CANON.0 | Self::STR_NUM.0 | Self::STR_NAN.0 | Self::STR_BOOL.0);
     pub const BOOLEAN: Ty = Ty(Self::BOOL_T.0 | Self::BOOL_F.0);
     pub const ANY: Ty = Ty(Self::NUMBER_OR_NAN.0 | Self::STRING.0 | Self::BOOLEAN.0);
@@ -78,6 +81,8 @@ impl Ty {
                     } else {
                         Ty::STR_NAN
                     }
+                } else if n.is_infinite() && (s.eq_str("Infinity") || s.eq_str("-Infinity")) {
+                    Ty::STR_CINF
                 } else if is_canonical(&s.to_rust_string(), n) {
                     let text = s.to_rust_string();
                     if n == n.trunc() {
@@ -135,6 +140,9 @@ impl Ty {
         if self.has(Ty::STR_CFRACT) || self.has(Ty::STR_CSHORT) {
             r |= Ty::FRACT;
         }
+        if self.has(Ty::STR_CINF) {
+            r |= Ty::INF;
+        }
         if self.has(Ty::STR_NUM) {
             r |= Ty::NUMBER;
         }
@@ -150,6 +158,9 @@ impl Ty {
         }
         if self.has(Ty::STR_CFRACT) || self.has(Ty::STR_CSHORT) {
             r |= Ty::FRACT;
+        }
+        if self.has(Ty::STR_CINF) {
+            r |= Ty::INF;
         }
         r
     }
@@ -197,9 +208,9 @@ impl Not for Ty {
 
 impl std::fmt::Debug for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const NAMES: [&str; 17] = [
+        const NAMES: [&str; 18] = [
             "+inf", "+int", "+fract", "0", "-0", "-int", "-fract", "-inf", "NaN", "str:int", "str:fract", "str:num", "str:text", "str:bool",
-            "true", "false", "str:fract2",
+            "true", "false", "str:fract2", "str:inf",
         ];
         if *self == Ty::ANY {
             return write!(f, "any");
@@ -306,7 +317,10 @@ mod tests {
         assert_eq!(s(" 5"), Ty::STR_NUM);
         assert_eq!(s("1e3"), Ty::STR_NUM);
         assert_eq!(s("0x10"), Ty::STR_NUM);
-        assert_eq!(s("Infinity"), Ty::STR_NUM);
+        assert_eq!(s("Infinity"), Ty::STR_CINF);
+        assert_eq!(s("-Infinity"), Ty::STR_CINF);
+        assert_eq!(s("infinity"), Ty::STR_NAN);
+        assert_eq!(s("+Infinity"), Ty::STR_NUM);
         assert_eq!(s("007"), Ty::STR_NUM);
         assert_eq!(s(""), Ty::STR_NAN);
         assert_eq!(s("  "), Ty::STR_NAN);

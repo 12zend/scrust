@@ -60,6 +60,16 @@ Compares fencing, size clamping, `touching` and bounce results with `render/expe
 node conformance/bench/run.js
 ```
 
+Real projects against TurboWarp's compiler (headless, deterministic, scripts only; native and wasm builds; min of `--repeat` runs), and a trace check of optimised builds against another checkout's builds:
+
+```bash
+node conformance/bench/real.js /path/to/sb3/dir --frames 150 --repeat 2
+```
+
+```bash
+node conformance/bench/verify.js /path/to/sb3/dir --ref /path/to/other/checkout --frames 60
+```
+
 ## Demo
 
 `node conformance/demo/make.js` writes `conformance/out/demo.sb3` (SVG costumes, pen, clones, effects, sound).

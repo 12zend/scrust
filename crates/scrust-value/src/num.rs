@@ -566,19 +566,11 @@ fn to_fixed10_slow(a: f64) -> f64 {
     s.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// JS `parseInt(String(x), 10) === x` (used by `Cast.isInt` for numbers).
+/// `Cast.isInt` for a number, TurboWarp's `val === Math.floor(val)` (NaN
+/// counts as an integer; vanilla scratch-vm compared with `parseInt`, which
+/// rejected `Infinity` and numbers from 1e21 up).
 pub fn js_is_int_number(x: f64) -> bool {
-    if x.is_nan() {
-        return true;
-    }
-    if x.is_infinite() {
-        return false; // parseInt("Infinity") is NaN
-    }
-    // "1e+21" and up parse as their leading digit(s).
-    if x.abs() >= 1e21 {
-        return false;
-    }
-    x == x.trunc()
+    x.is_nan() || x == x.floor()
 }
 
 /// `Number.prototype.toFixed(digits)` for `0 <= digits <= 20`.
