@@ -30,8 +30,9 @@ const run = (cmd, args) => new Promise(resolve => {
 });
 
 // A canonical numeric string is observably equal to its number once a
-// variable is unboxed (PRODUCT.md §8.6): normalise both sides.
-const canonical = s => /^-?\d+(\.\d+)?$/.test(s) && String(Number(s)) === s;
+// variable is unboxed (PRODUCT.md §8.6): normalise both sides. "Infinity"
+// and "-Infinity" are canonical too (see docs/decisions/kind-sensitivity.md).
+const canonical = s => (/^-?\d+(\.\d+)?$/.test(s) || s === 'Infinity' || s === '-Infinity') && String(Number(s)) === s;
 function normalise (line) {
     let o;
     try { o = JSON.parse(line); } catch (e) { return line; }
