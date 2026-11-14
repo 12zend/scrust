@@ -335,7 +335,13 @@ pub struct PenState {
     pub transparency: f64,
     pub legacy_shade: f64,
     pub diameter: f64,
+    /// The colour the renderer draws with; recomputed from the HSV state
+    /// only when a line is drawn (`sync_rgba`) after `rgba_stale` was set.
     pub rgba: [f32; 4],
+    pub rgba_stale: bool,
+    /// `set pen color to (color)` not yet converted to the HSV fields: the
+    /// conversion runs when something reads them (`PenState::resolve`).
+    pub pending_rgba: Option<[u8; 4]>,
 }
 
 impl Default for PenState {
@@ -349,6 +355,8 @@ impl Default for PenState {
             legacy_shade: 50.0,
             diameter: 1.0,
             rgba: [0.0, 0.0, 1.0, 1.0],
+            rgba_stale: false,
+            pending_rgba: None,
         }
     }
 }
@@ -532,6 +540,50 @@ pub struct World {
     pub username: JsStr,
     bubble_uid: u64,
     answers_used: usize,
+    /// Per sprite: hash of a costume name (`name_hash`) -> first costume with
+    /// that hash (`_getCostumeIndexByName` without comparing every name).
+    pub(crate) costume_names: Vec<std::collections::HashMap<u64, usize>>,
+    /// `sin` / `cos` blocks: direct-mapped caches of argument bits -> result
+    /// (projects evaluate the same angles over and over, per pixel).
+    trig_cache: Box<[[(u64, f64); 256]; 2]>,
+}
+
+/// An empty `trig_cache` slot: a NaN argument, whose sine and cosine are NaN.
+const TRIG_EMPTY: (u64, f64) = (0x7ff8_0000_0000_0001, f64::NAN);
+
+impl World {
+    #[inline]
+    fn trig_cached(&mut self, which: usize, n: f64, f: fn(f64) -> f64) -> f64 {
+        let k = n.to_bits();
+        let slot = &mut self.trig_cache[which][(k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize];
+        if slot.0 == k {
+            return slot.1;
+        }
+        let r = f(n);
+        *slot = (k, r);
+        r
+    }
+
+    /// `operator_mathop` sin (degrees, rounded to ten decimals).
+    #[inline]
+    pub fn sin_deg(&mut self, n: f64) -> f64 {
+        self.trig_cached(0, n, scrust_value::ops::sin_deg)
+    }
+
+    /// `operator_mathop` cos (degrees, rounded to ten decimals).
+    #[inline]
+    pub fn cos_deg(&mut self, n: f64) -> f64 {
+        self.trig_cached(1, n, scrust_value::ops::cos_deg)
+    }
+}
+
+/// Exact (case-sensitive) hash of a string's UTF-16 code units.
+pub(crate) fn name_hash(s: &JsStr) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ s.len() as u64;
+    for u in s.flat().units() {
+        h = (h ^ u as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Fixed epoch of the deterministic clock: 2020-01-01T00:00:00Z.
@@ -573,6 +625,18 @@ impl World {
             username: JsStr::empty(),
             bubble_uid: 0,
             answers_used: 0,
+            trig_cache: Box::new([[TRIG_EMPTY; 256]; 2]),
+            costume_names: program
+                .sprites
+                .iter()
+                .map(|s| {
+                    let mut m = std::collections::HashMap::new();
+                    for (i, c) in s.costumes.iter().enumerate() {
+                        m.entry(name_hash(&JsStr::from(c.name))).or_insert(i);
+                    }
+                    m
+                })
+                .collect(),
         });
         for (si, s) in program.sprites.iter().enumerate() {
             let t = Target {

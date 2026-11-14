@@ -62,6 +62,10 @@ pub struct Gen<'a> {
     /// Synchronous procedure variants whose bodies receive their variable
     /// storage as `&mut` arguments (see `noalias_variants`).
     noalias: std::collections::HashSet<(ProcId, bool)>,
+    /// Synchronous procedure variants specialised for numeric arguments
+    /// (`(proc, warp, num_params)`), requested by calls and not yet emitted.
+    spec_todo: Vec<(ProcId, bool, u64)>,
+    spec_done: std::collections::HashSet<(ProcId, bool, u64)>,
 }
 
 /// What follows a statement list.
@@ -91,7 +95,7 @@ struct FnCx {
 }
 
 pub fn generate(project: &Project, program: &Program, an: &Analysis, opts: &GenOptions) -> Output {
-    let mut g = Gen { project, program, an, opts, out: String::new(), indent: 0, tmp: 0, pending: String::new(), flow: Default::default(), noalias: Default::default() };
+    let mut g = Gen { project, program, an, opts, out: String::new(), indent: 0, tmp: 0, pending: String::new(), flow: Default::default(), noalias: Default::default(), spec_todo: Vec::new(), spec_done: Default::default() };
     g.noalias = g.noalias_variants();
     let mut files = Vec::new();
     let mut assets = Vec::new();
@@ -128,10 +132,26 @@ pub fn generate(project: &Project, program: &Program, an: &Analysis, opts: &GenO
 
 fn repr_ty(r: Repr) -> &'static str {
     match r {
-        Repr::F64 => "f64",
+        Repr::F64 | Repr::F64E => "f64",
         Repr::Bool => "bool",
         Repr::Str => "JsStr",
         Repr::Val => "Value",
+    }
+}
+
+/// List element type of a representation (`F64E` items are wrapped).
+fn elem_ty(r: Repr) -> &'static str {
+    match r {
+        Repr::F64E => "F64E",
+        r => repr_ty(r),
+    }
+}
+
+/// `code` (of representation `r`) as a list element.
+fn elem_code(code: String, r: Repr) -> String {
+    match r {
+        Repr::F64E => format!("F64E({code})"),
+        _ => code,
     }
 }
 
@@ -512,7 +532,7 @@ impl<'a> Gen<'a> {
         for (i, l) in t.lists.iter().enumerate() {
             let r = self.an.repr(Node::List(ListId { target: ti, index: i }));
             self.line(&format!("    /// {}", l.name.replace('\n', " ")));
-            self.line(&format!("    pub l{i}: List<{}>,", repr_ty(r)));
+            self.line(&format!("    pub l{i}: List<{}>,", elem_ty(r)));
         }
         self.line("}");
         self.line("");
@@ -553,16 +573,20 @@ impl<'a> Gen<'a> {
         self.line("    fn var_by_name(&self, name: &str) -> Option<Value> {");
         self.line("        match name {");
         let mut seen = std::collections::HashSet::new();
+        let to_value = |g: &Self, i: usize| match g.an.repr(Node::Var(VarId { target: ti, index: i })) {
+            Repr::F64E => format!("f64e_val(self.v{i})"),
+            _ => format!("self.v{i}.to_value()"),
+        };
         for (i, v) in t.vars.iter().enumerate() {
             if seen.insert(v.name.clone()) {
-                self.line(&format!("            {} => Some(self.v{i}.to_value()),", rust_str(&v.name)));
+                self.line(&format!("            {} => Some({}),", rust_str(&v.name), to_value(self, i)));
             }
         }
         self.line("            _ => None,");
         self.line("        }");
         self.line("    }");
         self.line("    fn vars(&self) -> Vec<(&'static str, Value)> {");
-        let items: Vec<String> = t.vars.iter().enumerate().map(|(i, v)| format!("({}, self.v{i}.to_value())", rust_str(&v.name))).collect();
+        let items: Vec<String> = t.vars.iter().enumerate().map(|(i, v)| format!("({}, {})", rust_str(&v.name), to_value(self, i))).collect();
         self.line(&format!("        vec![{}]", items.join(", ")));
         self.line("    }");
         self.line("    fn lists(&self) -> Vec<(&'static str, Vec<Value>)> {");
@@ -576,6 +600,7 @@ impl<'a> Gen<'a> {
             let conv = match r {
                 Repr::Val => "value".to_string(),
                 Repr::F64 => "<f64 as Elem>::from_value(&value)".to_string(),
+                Repr::F64E => "f64e_from_value(&value)".to_string(),
                 Repr::Bool => "<bool as Elem>::from_value(&value)".to_string(),
                 Repr::Str => "value.to_str()".to_string(),
             };
@@ -596,8 +621,13 @@ impl<'a> Gen<'a> {
             let id = ProcId { target: ti, index: pi };
             for warp in [false, true] {
                 if self.an.variants.contains(&(id, warp)) {
-                    self.proc_fn(id, warp);
+                    self.proc_fn(id, warp, 0);
                 }
+            }
+        }
+        while let Some(v) = self.spec_todo.pop() {
+            if self.spec_done.insert(v) {
+                self.proc_fn(v.0, v.1, v.2);
             }
         }
         let pending = std::mem::take(&mut self.pending);
@@ -611,7 +641,7 @@ impl<'a> Gen<'a> {
         // Edge-activated hat predicate.
         match &sc.hat {
             Hat::GreaterThan { menu, value } => {
-                let cx = Cx { owner, ti };
+                let cx = Cx { owner, ti, num_params: 0 };
                 let v = self.expr(value, &cx);
                 self.line(&format!("pub fn t{ti}_s{si}_pred(w: &mut World, me: TargetRef) -> bool {{"));
                 self.indent += 1;
@@ -627,7 +657,7 @@ impl<'a> Gen<'a> {
                 self.line("");
             }
             Hat::TouchingObject(obj) => {
-                let cx = Cx { owner, ti };
+                let cx = Cx { owner, ti, num_params: 0 };
                 let v = self.expr(obj, &cx);
                 self.line(&format!("pub fn t{ti}_s{si}_pred(w: &mut World, me: TargetRef) -> bool {{"));
                 self.indent += 1;
@@ -644,7 +674,7 @@ impl<'a> Gen<'a> {
         self.line("    Box::pin(async move {");
         self.indent += 2;
         self.prologue(ti, true);
-        let mut fc = FnCx { cx: Cx { owner, ti }, warp: false, is_async: true, depth: 0, w_open: false, noalias: false, is_proc: false, in_part: false };
+        let mut fc = FnCx { cx: Cx { owner, ti, num_params: 0 }, warp: false, is_async: true, depth: 0, w_open: false, noalias: false, is_proc: false, in_part: false };
         let body = &self.program.targets[ti].scripts[si].body;
         self.emit_body(body, &mut fc, &format!("t{ti}_s{si}"), &[]);
         self.indent -= 2;
@@ -875,18 +905,32 @@ impl<'a> Gen<'a> {
         format!("t{}_p{}_{}", id.target, id.index, if warp { "w" } else { "n" })
     }
 
+    fn spec_name(&self, id: ProcId, warp: bool, num_params: u64) -> String {
+        if num_params == 0 {
+            self.proc_name(id, warp)
+        } else {
+            format!("{}_s{:x}", self.proc_name(id, warp), num_params)
+        }
+    }
+
     fn proc_is_async(&self, id: ProcId, warp: bool) -> bool {
         self.an.yields.get(&(id, warp)).copied().unwrap_or(true)
     }
 
-    fn proc_fn(&mut self, id: ProcId, warp: bool) {
+    /// Emit a procedure variant; `num_params` selects parameters received
+    /// as plain numbers (0: the general variant).
+    fn proc_fn(&mut self, id: ProcId, warp: bool, num_params: u64) {
         let pr = &self.program.targets[id.target].procs[id.index];
         let is_async = self.proc_is_async(id, warp);
-        let name = self.proc_name(id, warp);
-        let params: Vec<String> =
-            (0..pr.params.len()).map(|i| format!("a{}: {}", i, repr_ty(self.an.repr(Node::Param(id, i))))).collect();
+        let name = self.spec_name(id, warp, num_params);
+        let params: Vec<String> = (0..pr.params.len())
+            .map(|i| {
+                let ty = if i < 64 && num_params & (1 << i) != 0 { "f64" } else { repr_ty(self.an.repr(Node::Param(id, i))) };
+                format!("a{}: {}", i, ty)
+            })
+            .collect();
         self.line(&format!("/// {}{}", pr.proccode.replace('\n', " "), if warp { " (warp)" } else { "" }));
-        let mut fc = FnCx { cx: Cx { owner: Owner::Proc(id), ti: id.target }, warp, is_async, depth: 0, w_open: false, noalias: false, is_proc: true, in_part: false };
+        let mut fc = FnCx { cx: Cx { owner: Owner::Proc(id), ti: id.target, num_params }, warp, is_async, depth: 0, w_open: false, noalias: false, is_proc: true, in_part: false };
         if is_async {
             let sep = if params.is_empty() { "" } else { ", " };
             self.line(&format!("pub fn {name}(me: TargetRef{sep}{}) -> Pin<Box<dyn Future<Output = bool>>> {{", params.join(", ")));
@@ -1088,6 +1132,7 @@ impl<'a> Gen<'a> {
                 match r {
                     Repr::F64 => self.line(&format!("{{ let d_ = {}; let p_ = &mut {}; *p_ = {} + d_; }}", x.num(), place, E { code: "*p_".into(), place: None, ..cur }.num())),
                     Repr::Val => self.line(&format!("{{ let d_ = {}; let p_ = &mut {}; *p_ = Value::Num(p_.to_num() + d_); }}", x.num(), place)),
+                    Repr::F64E => self.line(&format!("{{ let d_ = {}; let p_ = &mut {}; *p_ = nn(*p_) + d_; }}", x.num(), place)),
                     // The analysis types a changed variable as a number, so
                     // other representations cannot be chosen for it.
                     Repr::Str | Repr::Bool => self.line(&format!("{{ let d_ = {}; let _ = d_; }}", x.num())),
@@ -1108,7 +1153,7 @@ impl<'a> Gen<'a> {
                 let x = self.expr(e, &fc.cx);
                 let r = self.an.repr(Node::List(*l));
                 let place = self.list_place(*l, &fc.cx, true);
-                self.line(&format!("{{ let t_ = {}; {}.add(t_); }}", x.as_repr(r), place));
+                self.line(&format!("{{ let t_ = {}; {}.add(t_); }}", elem_code(x.as_repr(r), r), place));
             }
             Stmt::ListDelete(l, idx) => {
                 self.open_w(fc);
@@ -1131,7 +1176,7 @@ impl<'a> Gen<'a> {
                 let place = self.list_place(*l, &fc.cx, true);
                 let rplace = self.list_place(*l, &fc.cx, false);
                 let (pre, ix) = self.list_index(&i, &rplace, 1, false);
-                self.line(&format!("{{ let t_ = {}; {} let ix_ = {}; {}.insert(ix_, t_); }}", x.as_repr(r), pre, ix, place));
+                self.line(&format!("{{ let t_ = {}; {} let ix_ = {}; {}.insert(ix_, t_); }}", elem_code(x.as_repr(r), r), pre, ix, place));
             }
             Stmt::ListReplace(l, idx, item) => {
                 self.open_w(fc);
@@ -1143,7 +1188,7 @@ impl<'a> Gen<'a> {
                 let (pre, ix) = self.list_index(&i, &rplace, 0, false);
                 // Inputs are evaluated first (in block order); the index is
                 // resolved (possibly drawing a random number) when the block runs.
-                self.line(&format!("{{ {} let t_ = {}; let ix_ = {}; {}.replace(ix_, t_); }}", pre, x.as_repr(r), ix, place));
+                self.line(&format!("{{ {} let t_ = {}; let ix_ = {}; {}.replace(ix_, t_); }}", pre, elem_code(x.as_repr(r), r), ix, place));
             }
             Stmt::Cmd(cmd, args, order) => {
                 self.open_w(fc);
@@ -1528,9 +1573,25 @@ impl<'a> Gen<'a> {
             self.line("yield_now().await;");
         }
         let mut codes: Vec<String> = Vec::new();
+        // A synchronous callee whose boxed parameter receives a plain number
+        // here gets a variant taking it as `f64` (the raw value is that number).
+        let mut num_params = 0u64;
+        let mut name = name;
         for (i, a) in args.iter().enumerate() {
             let x = self.expr(a, &fc.cx);
-            codes.push(x.as_repr(self.an.repr(Node::Param(proc, i))));
+            let r = self.an.repr(Node::Param(proc, i));
+            if !callee_async && i < 64 && matches!(r, Repr::Val | Repr::Str | Repr::F64E) && !x.missing && x.rt == RT::Num && x.alt.is_none() && !matches!(x.lit, Some(ref v) if !matches!(v, Value::Num(_))) {
+                num_params |= 1 << i;
+                codes.push(x.as_repr(Repr::F64));
+            } else {
+                codes.push(x.as_repr(r));
+            }
+        }
+        if num_params != 0 {
+            name = self.spec_name(proc, callee_warp, num_params);
+            if !self.spec_done.contains(&(proc, callee_warp, num_params)) {
+                self.spec_todo.push((proc, callee_warp, num_params));
+            }
         }
         let names: String = (0..args.len()).map(|i| format!(", p{k}_{i}")).collect();
         let impure: Vec<&Expr> = args.iter().filter(|a| a.is_impure()).collect();

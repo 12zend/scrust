@@ -52,7 +52,22 @@ impl World {
     // ===================================================================== motion
 
     /// `RenderedTarget.setXY`.
+    #[inline]
     pub fn set_xy(&mut self, t: TargetRef, x: f64, y: f64) {
+        if self.renderer.is_none() {
+            // Without a renderer there is no fence, no redraw and no pen line.
+            let tg = self.target_mut(t);
+            if !(tg.is_stage || tg.dragging) {
+                tg.x = x;
+                tg.y = y;
+            }
+            return;
+        }
+        self.set_xy_rendered(t, x, y);
+    }
+
+    #[inline(never)]
+    fn set_xy_rendered(&mut self, t: TargetRef, x: f64, y: f64) {
         let tg = self.target(t);
         if tg.is_stage || tg.dragging {
             return;
@@ -68,6 +83,7 @@ impl World {
         self.pen_moved(t, ox, oy);
     }
 
+    #[inline]
     pub fn move_steps(&mut self, me: TargetRef, steps: f64) {
         let tg = self.target(me);
         let radians = deg_to_rad(90.0 - tg.direction);
@@ -77,6 +93,7 @@ impl World {
         self.set_xy(me, x, y);
     }
 
+    #[inline]
     pub fn go_to_xy(&mut self, me: TargetRef, x: f64, y: f64) {
         self.set_xy(me, x, y);
     }
@@ -153,20 +170,24 @@ impl World {
         self.set_direction(me, direction);
     }
 
+    #[inline]
     pub fn change_x(&mut self, me: TargetRef, dx: f64) {
         let tg = self.target(me);
         let (x, y) = (tg.x + dx, tg.y);
         self.set_xy(me, x, y);
     }
+    #[inline]
     pub fn set_x(&mut self, me: TargetRef, x: f64) {
         let y = self.target(me).y;
         self.set_xy(me, x, y);
     }
+    #[inline]
     pub fn change_y(&mut self, me: TargetRef, dy: f64) {
         let tg = self.target(me);
         let (x, y) = (tg.x, tg.y + dy);
         self.set_xy(me, x, y);
     }
+    #[inline]
     pub fn set_y(&mut self, me: TargetRef, y: f64) {
         let x = self.target(me).x;
         self.set_xy(me, x, y);
@@ -363,7 +384,15 @@ impl World {
     }
 
     fn costume_index_by_name(&self, t: TargetRef, name: &JsStr) -> Option<usize> {
-        self.program.sprites[self.target(t).sprite].costumes.iter().position(|c| name.eq_str(c.name))
+        let sprite = self.target(t).sprite;
+        let costumes = &self.program.sprites[sprite].costumes;
+        let &i = self.costume_names[sprite].get(&name_hash(name))?;
+        if name.eq_str(costumes[i].name) {
+            Some(i)
+        } else {
+            // Another name with the same hash comes first.
+            costumes.iter().position(|c| name.eq_str(c.name))
+        }
     }
 
     /// `_setCostume` / the costume part of `_setBackdrop`.
@@ -1061,9 +1090,23 @@ impl World {
     /// `Cast.toListIndex` with access to the RNG.
     #[inline]
     pub fn list_index(&mut self, index: &Value, len: usize, accept_all: bool) -> scrust_value::ListIndex {
-        if let Value::Num(n) = index {
-            return scrust_value::num_to_list_index(if n.is_nan() { 0.0 } else { *n }, len);
+        match index {
+            Value::Num(n) => return scrust_value::num_to_list_index(if n.is_nan() { 0.0 } else { *n }, len),
+            Value::Str(s) => {
+                // Numeric strings (the number is cached on the string) are
+                // never one of the keywords.
+                let n = scrust_value::js_string_to_number(s);
+                if !n.is_nan() {
+                    return scrust_value::num_to_list_index(n, len);
+                }
+            }
+            Value::Bool(_) => {}
         }
+        self.list_index_slow(index, len, accept_all)
+    }
+
+    #[inline(never)]
+    fn list_index_slow(&mut self, index: &Value, len: usize, accept_all: bool) -> scrust_value::ListIndex {
         let rng = &mut self.rng;
         scrust_value::to_list_index(index, len, accept_all, &mut || rng.next())
     }
@@ -1197,9 +1240,31 @@ pub fn to_rgb(v: &Value) -> [u8; 3] {
 }
 
 /// `Cast.toRgbColorObject` (with alpha).
+#[inline]
 pub fn to_rgba(v: &Value) -> [u8; 4] {
+    if let Value::Num(n) = v {
+        return decimal_to_rgba(*n);
+    }
+    to_rgba_slow(v)
+}
+
+#[inline]
+fn decimal_to_rgba(n: f64) -> [u8; 4] {
+    // Color.decimalToRgb (Cast.toNumber: NaN is 0, and ToInt32(NaN) is 0 too)
+    let d = js_to_int32(n);
+    let a = ((d >> 24) & 0xFF) as u8;
+    let r = ((d >> 16) & 0xFF) as u8;
+    let g = ((d >> 8) & 0xFF) as u8;
+    let b = (d & 0xFF) as u8;
+    [r, g, b, if a > 0 { a } else { 255 }]
+}
+
+fn to_rgba_slow(v: &Value) -> [u8; 4] {
     if let Value::Str(s) = v {
         if s.len() > 0 && s.code_unit(0) == b'#' as u16 {
+            if let scrust_value::FlatRef::L1(b) = s.flat() {
+                return hex_to_rgb_bytes(b).unwrap_or([0, 0, 0, 255]);
+            }
             return hex_to_rgb(&s.to_rust_string()).unwrap_or([0, 0, 0, 255]);
         }
     }
@@ -1214,13 +1279,33 @@ pub fn to_rgba(v: &Value) -> [u8; 4] {
 }
 
 /// ECMAScript ToInt32.
+#[inline]
 pub fn js_to_int32(n: f64) -> i32 {
     if !n.is_finite() {
         return 0;
     }
+    // Truncation to i64 keeps the low 32 bits of the two's complement
+    // integer, which is exactly the value mod 2^32.
+    if n.abs() < 9.0e18 {
+        return n as i64 as u32 as i32;
+    }
     let m = n.trunc() % 4294967296.0;
     let m = if m < 0.0 { m + 4294967296.0 } else { m };
     (m as u64 as u32) as i32
+}
+
+/// `hex_to_rgb` on Latin-1 bytes, without allocating.
+fn hex_to_rgb_bytes(b: &[u8]) -> Option<[u8; 4]> {
+    let h = b.strip_prefix(b"#")?;
+    let d = |c: u8| (c as char).to_digit(16).map(|x| x as u8);
+    match h.len() {
+        3 => {
+            let (r, g, b) = (d(h[0])?, d(h[1])?, d(h[2])?);
+            Some([r * 17, g * 17, b * 17, 255])
+        }
+        6 => Some([d(h[0])? * 16 + d(h[1])?, d(h[2])? * 16 + d(h[3])?, d(h[4])? * 16 + d(h[5])?, 255]),
+        _ => None,
+    }
 }
 
 /// `Color.hexToRgb`: `#rgb` or `#rrggbb`.

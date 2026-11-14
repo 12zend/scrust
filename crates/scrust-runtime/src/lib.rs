@@ -20,14 +20,80 @@ pub use world::*;
 /// Everything generated code needs.
 pub mod prelude {
     pub use crate::blocks::Glide;
-    pub use crate::list::{Elem, List, Lit};
+    pub use crate::list::{Elem, List, Lit, F64E};
     pub use crate::sched::{die, wait_external, yield_loop, yield_now, yield_status, yield_tick, BoxFut, HatKind, Status, Wake};
     pub use crate::world::*;
-    pub use crate::{val_bool, val_num, val_str};
+    pub use crate::{f64e_from_str, f64e_from_value, f64e_num, f64e_str, f64e_val, val_bool, val_num, val_str, F64E_EMPTY};
     pub use scrust_value::ops;
     pub use scrust_value::{
         compare, compare_lit, compare_str_ci, compare_str_ci_lit, compare_val_str, letter_eq_ci, js_num_to_str, js_round, num_eq, num_gt, num_lt, num_to_list_index, JsStr, ListIndex, MathOp, ToBool, ToNum, ToStr, ToValue, Value,
     };
+}
+
+/// `""` in `F64E` storage (a number, or the empty string): a NaN payload that
+/// no arithmetic produces. Every numeric read goes through `nn` (or
+/// `f64e_num`) first, so it never reaches arithmetic and cannot propagate.
+pub const F64E_EMPTY: f64 = f64::from_bits(0x7ff8_0000_e3e7_e5e1);
+
+#[inline(always)]
+fn f64e_is_empty(x: f64) -> bool {
+    x.to_bits() == F64E_EMPTY.to_bits()
+}
+
+/// `Number(x)` of an `F64E` value.
+#[inline(always)]
+pub fn f64e_num(x: f64) -> f64 {
+    if f64e_is_empty(x) {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// `Cast.toString` of an `F64E` value.
+#[inline]
+pub fn f64e_str(x: f64) -> JsStr {
+    if f64e_is_empty(x) {
+        JsStr::empty()
+    } else {
+        scrust_value::js_num_to_str(x)
+    }
+}
+
+/// The raw value of an `F64E` value.
+#[inline]
+pub fn f64e_val(x: f64) -> Value {
+    if f64e_is_empty(x) {
+        Value::Str(JsStr::empty())
+    } else {
+        Value::Num(x)
+    }
+}
+
+/// A value known (by type analysis) to be a number, a canonical numeric
+/// string or `""`, as `F64E`.
+#[inline]
+pub fn f64e_from_value(v: &Value) -> f64 {
+    match v {
+        Value::Num(n) => {
+            if n.is_nan() {
+                f64::NAN
+            } else {
+                *n
+            }
+        }
+        Value::Str(s) => f64e_from_str(s),
+        Value::Bool(b) => *b as u8 as f64,
+    }
+}
+
+#[inline]
+pub fn f64e_from_str(s: &JsStr) -> f64 {
+    if s.is_empty() {
+        F64E_EMPTY
+    } else {
+        scrust_value::js_string_to_number(s)
+    }
 }
 
 /// Read a dynamic value that flow analysis proved to be a number.

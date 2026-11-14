@@ -20,6 +20,7 @@ pub fn js_string_to_number(s: &JsStr) -> f64 {
     s.cached_number(parse_string_number)
 }
 
+#[inline(never)]
 fn parse_string_number(s: &JsStr) -> f64 {
     match s.flat() {
         FlatRef::L1(b) => {

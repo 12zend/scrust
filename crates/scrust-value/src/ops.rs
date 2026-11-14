@@ -140,20 +140,173 @@ fn round10_fast(fast: f64, exact: impl FnOnce() -> f64) -> f64 {
     round10(exact())
 }
 
-#[inline]
+/// Out of line: the fast path is long, and inlined into every call site it
+/// costs more in code size than the call.
 pub fn sin_deg(n: f64) -> f64 {
     let r = (PI * n) / 180.0;
-    round10_fast(libm::sin(r), || crate::jsmath::sin(r))
+    round10_fast(fast_trig::sin(r), || crate::jsmath::sin(r))
 }
-#[inline]
+/// Out of line: the fast path is long, and inlined into every call site it
+/// costs more in code size than the call.
 pub fn cos_deg(n: f64) -> f64 {
     let r = (PI * n) / 180.0;
-    round10_fast(libm::cos(r), || crate::jsmath::cos(r))
+    round10_fast(fast_trig::cos(r), || crate::jsmath::cos(r))
+}
+
+/// musl's `sin` / `cos` (as in the `libm` crate, within one ULP), inlined,
+/// with the argument reduction always taking musl's "medium" path (exact
+/// enough for every |x| < 2^20 pi/2, its special cases near small multiples
+/// of pi/2 only exist to save a few operations) instead of the out-of-line,
+/// branchy `rem_pio2`. Larger arguments go to the `libm` crate.
+mod fast_trig {
+    const TO_INT: f64 = 1.5 / f64::EPSILON;
+    const INV_PIO2: f64 = 6.36619772367581382433e-01;
+    const PIO2_1: f64 = 1.57079632673412561417e+00;
+    const PIO2_1T: f64 = 6.07710050650619224932e-11;
+    const PIO2_2: f64 = 6.07710050630396597660e-11;
+    const PIO2_2T: f64 = 2.02226624879595063154e-21;
+    const PIO2_3: f64 = 2.02226624871116645580e-21;
+    const PIO2_3T: f64 = 8.47842766036889956997e-32;
+
+    #[inline(always)]
+    fn medium(x: f64, ix: u32) -> (i32, f64, f64) {
+        let f_n = (x * INV_PIO2 + TO_INT) - TO_INT;
+        let n = f_n as i32;
+        let mut r = x - f_n * PIO2_1;
+        let mut w = f_n * PIO2_1T;
+        let mut y0 = r - w;
+        let ex = (ix >> 20) as i32;
+        let ey = (y0.to_bits() >> 52) as i32 & 0x7ff;
+        if ex - ey > 16 {
+            let t = r;
+            w = f_n * PIO2_2;
+            r = t - w;
+            w = f_n * PIO2_2T - ((t - r) - w);
+            y0 = r - w;
+            let ey = (y0.to_bits() >> 52) as i32 & 0x7ff;
+            if ex - ey > 49 {
+                let t = r;
+                w = f_n * PIO2_3;
+                r = t - w;
+                w = f_n * PIO2_3T - ((t - r) - w);
+                y0 = r - w;
+            }
+        }
+        let y1 = (r - y0) - w;
+        (n, y0, y1)
+    }
+
+    const S1: f64 = -1.66666666666666324348e-01;
+    const S2: f64 = 8.33333333332248946124e-03;
+    const S3: f64 = -1.98412698298579493134e-04;
+    const S4: f64 = 2.75573137070700676789e-06;
+    const S5: f64 = -2.50507602534068634195e-08;
+    const S6: f64 = 1.58969099521155010221e-10;
+
+    #[inline(always)]
+    fn k_sin(x: f64, y: f64, iy: bool) -> f64 {
+        let z = x * x;
+        let w = z * z;
+        let r = S2 + z * (S3 + z * S4) + z * w * (S5 + z * S6);
+        let v = z * x;
+        if !iy {
+            x + v * (S1 + z * r)
+        } else {
+            x - ((z * (0.5 * y - v * r) - y) - v * S1)
+        }
+    }
+
+    const C1: f64 = 4.16666666666666019037e-02;
+    const C2: f64 = -1.38888888888741095749e-03;
+    const C3: f64 = 2.48015872894767294178e-05;
+    const C4: f64 = -2.75573143513906633035e-07;
+    const C5: f64 = 2.08757232129817482790e-09;
+    const C6: f64 = -1.13596475577881948265e-11;
+
+    #[inline(always)]
+    fn k_cos(x: f64, y: f64) -> f64 {
+        let z = x * x;
+        let w = z * z;
+        let r = z * (C1 + z * (C2 + z * C3)) + w * w * (C4 + z * (C5 + z * C6));
+        let hz = 0.5 * z;
+        let w = 1.0 - hz;
+        w + (((1.0 - w) - hz) + (z * r - x * y))
+    }
+
+    #[inline]
+    pub fn sin(x: f64) -> f64 {
+        let ix = (x.to_bits() >> 32) as u32 & 0x7fffffff;
+        if ix <= 0x3fe921fb {
+            if ix < 0x3e500000 {
+                return x;
+            }
+            return k_sin(x, 0.0, false);
+        }
+        if ix >= 0x413921fb {
+            return libm::sin(x);
+        }
+        let (n, y0, y1) = medium(x, ix);
+        match n & 3 {
+            0 => k_sin(y0, y1, true),
+            1 => k_cos(y0, y1),
+            2 => -k_sin(y0, y1, true),
+            _ => -k_cos(y0, y1),
+        }
+    }
+
+    #[inline]
+    pub fn cos(x: f64) -> f64 {
+        let ix = (x.to_bits() >> 32) as u32 & 0x7fffffff;
+        if ix <= 0x3fe921fb {
+            if ix < 0x3e46a09e {
+                return 1.0;
+            }
+            return k_cos(x, 0.0);
+        }
+        if ix >= 0x413921fb {
+            return libm::cos(x);
+        }
+        let (n, y0, y1) = medium(x, ix);
+        match n & 3 {
+            0 => k_cos(y0, y1),
+            1 => -k_sin(y0, y1, true),
+            2 => -k_cos(y0, y1),
+            _ => k_sin(y0, y1, true),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn matches_libm() {
+            let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            for i in 0..2_000_000u64 {
+                let u = (next() >> 11) as f64 / (1u64 << 53) as f64;
+                let deg = match i % 4 {
+                    0 => (u - 0.5) * 2000.0,
+                    1 => ((u - 0.5) * 4000.0).round(),
+                    2 => (u - 0.5) * 2.0e7,
+                    _ => ((u - 0.5) * 720.0 * 8.0).round() / 8.0,
+                };
+                let r = (core::f64::consts::PI * deg) / 180.0;
+                assert_eq!(super::sin(r).to_bits(), libm::sin(r).to_bits(), "sin({r})");
+                assert_eq!(super::cos(r).to_bits(), libm::cos(r).to_bits(), "cos({r})");
+            }
+        }
+    }
 }
 /// TurboWarp's `tan` (jsexecute.js): the angle reduced by `% 360`, exact
 /// infinities at the poles.
+/// Out of line: the fast path is long, and inlined into every call site it
+/// costs more in code size than the call.
 pub fn tan_deg(n: f64) -> f64 {
-    let a = n % 360.0;
+    let a = fmod(n, 360.0);
     if a == -270.0 || a == 90.0 {
         return f64::INFINITY;
     }
@@ -191,6 +344,7 @@ pub fn exp(n: f64) -> f64 {
 /// `Math.pow(10, n)`. Integer exponents whose result (or reciprocal) is
 /// exactly representable are computed exactly, which is what every
 /// correctly-rounded platform `pow` returns (see docs/decisions/math-libm.md).
+#[inline]
 pub fn pow10(n: f64) -> f64 {
     const P: [f64; 23] = [
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,

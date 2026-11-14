@@ -390,6 +390,23 @@ pub fn compare_lit(a: &Value, n2: f64, text: &'static str) -> f64 {
 }
 
 fn compare_lit_slow(a: &Value, n2: f64, text: &'static str) -> f64 {
+    if let Value::Num(x) = a {
+        // As in `compare_num_str`: the first letter often decides it.
+        if n2.is_nan() || x.is_nan() {
+            let max = if x.is_finite() { b'9' } else { b'n' };
+            match text.as_bytes().first() {
+                None => return 1.0,
+                Some(&u) => {
+                    let l = crate::lower::l1_lower(u);
+                    if l > max {
+                        return -1.0;
+                    } else if l < b'-' {
+                        return 1.0;
+                    }
+                }
+            }
+        }
+    }
     let mut n1 = a.js_number();
     if n1 == 0.0 && is_not_actually_zero(a) {
         n1 = f64::NAN;
@@ -423,6 +440,20 @@ impl CompareKey {
             n = f64::NAN;
         }
         CompareKey { n, s: key.to_str() }
+    }
+
+    /// Is this a string comparison (the key is not numeric)? Then
+    /// `compare(x, key) === 0` exactly when `String(x)` equals the key's
+    /// string case-insensitively, whatever `x` is.
+    #[inline]
+    pub fn is_text(&self) -> bool {
+        self.n.is_nan()
+    }
+
+    /// The key's string form.
+    #[inline]
+    pub fn text(&self) -> &JsStr {
+        &self.s
     }
 
     #[inline]
@@ -467,8 +498,42 @@ impl CompareKey {
     }
 }
 
+/// Hash of a Latin-1 string's lower-cased form, `None` for other strings.
+/// Two Latin-1 strings with different hashes are never equal
+/// case-insensitively (Latin-1 lower-casing stays in Latin-1 and keeps the
+/// length). A string with a unit above 0xFF can still equal a Latin-1 one
+/// (KELVIN SIGN lower-cases to `k`), so callers must treat `None` as "may
+/// equal anything".
+pub fn ci_hash_l1(s: &JsStr) -> Option<u64> {
+    match s.flat() {
+        FlatRef::L1(b) => {
+            // FxHash-style mixing over 8-byte words of the lower-cased bytes.
+            const K: u64 = 0x517c_c1b7_2722_0a95;
+            let mut h: u64 = b.len() as u64;
+            let mut chunks = b.chunks_exact(8);
+            for c in &mut chunks {
+                let mut w = [0u8; 8];
+                for (d, &x) in w.iter_mut().zip(c) {
+                    *d = crate::lower::l1_lower(x);
+                }
+                h = (h.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(K);
+            }
+            let rest = chunks.remainder();
+            if !rest.is_empty() {
+                let mut w = [0u8; 8];
+                for (d, &x) in w.iter_mut().zip(rest) {
+                    *d = crate::lower::l1_lower(x);
+                }
+                h = (h.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(K);
+            }
+            Some(h)
+        }
+        FlatRef::U16(_) => None,
+    }
+}
+
 /// Case-insensitive equality (`compare_str_ci(a, b) == 0`).
-fn eq_ci(a: &JsStr, b: &JsStr) -> bool {
+pub fn eq_ci(a: &JsStr, b: &JsStr) -> bool {
     if a.ptr_eq(b) {
         return true;
     }

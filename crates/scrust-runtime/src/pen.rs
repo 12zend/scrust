@@ -11,7 +11,8 @@ fn clamp100(v: f64) -> f64 {
 
 /// `Color.hsvToRgb` (channels floored to integers 0..255).
 pub fn hsv_to_rgb(h: f64, s: f64, v: f64) -> [f64; 3] {
-    let mut h = h % 360.0;
+    // `h % 360` is the identity on [0, 360) (fmod is exact).
+    let mut h = if (0.0..360.0).contains(&h) { h } else { h % 360.0 };
     if h < 0.0 {
         h += 360.0;
     }
@@ -45,7 +46,9 @@ pub fn rgb_to_hsv(rgb: [f64; 3]) -> (f64, f64, f64) {
     if x != v {
         let f = if r == x { g - b } else if g == x { b - r } else { r - g };
         let i = if r == x { 3.0 } else if g == x { 5.0 } else { 1.0 };
-        h = ((i - (f / (v - x))) * 60.0) % 360.0;
+        h = (i - (f / (v - x))) * 60.0;
+        // In [0, 360] by construction; `% 360` only maps 360 to 0 (fmod is exact).
+        h = if (0.0..360.0).contains(&h) { h } else { h % 360.0 };
         s = (v - x) / v;
     }
     (h, s, v)
@@ -63,25 +66,58 @@ fn mix_rgb(a: [f64; 3], b: [f64; 3], f1: f64) -> [f64; 3] {
 }
 
 impl PenState {
+    #[inline]
     fn update_color(&mut self) {
+        self.rgba_stale = true;
+    }
+
+    /// Apply a pending `set pen color to` (`setPenColorToColor`).
+    #[inline]
+    pub fn resolve(&mut self) {
+        if let Some(rgba) = self.pending_rgba.take() {
+            let (h, s, v) = rgb_to_hsv([rgba[0] as f64, rgba[1] as f64, rgba[2] as f64]);
+            self.color = (h / 360.0) * 100.0;
+            self.saturation = s * 100.0;
+            self.brightness = v * 100.0;
+            self.transparency = 100.0 * (1.0 - (rgba[3] as f64 / 255.0));
+            self.legacy_shade = self.brightness / 2.0;
+            self.rgba_stale = true;
+        }
+    }
+
+    /// Bring `rgba` up to date with the HSV state (before drawing).
+    #[inline]
+    pub fn sync_rgba(&mut self) {
+        self.resolve();
+        if self.rgba_stale {
+            self.rgba_stale = false;
+            self.compute_rgba();
+        }
+    }
+
+    fn compute_rgba(&mut self) {
         let rgb = hsv_to_rgb(self.color * 360.0 / 100.0, self.saturation / 100.0, self.brightness / 100.0);
         self.rgba = [(rgb[0] / 255.0) as f32, (rgb[1] / 255.0) as f32, (rgb[2] / 255.0) as f32, (1.0 - self.transparency / 100.0) as f32];
     }
 
     fn set_or_change(&mut self, param: &JsStr, value: f64, change: bool) {
-        if param.eq_str("color") {
-            self.color = wrap_clamp(value + if change { self.color } else { 0.0 }, 0.0, 100.0);
-        } else if param.eq_str("saturation") {
-            self.saturation = clamp100(value + if change { self.saturation } else { 0.0 });
-        } else if param.eq_str("brightness") {
-            self.brightness = clamp100(value + if change { self.brightness } else { 0.0 });
-        } else if param.eq_str("transparency") {
-            self.transparency = clamp100(value + if change { self.transparency } else { 0.0 });
+        self.resolve();
+        let key: &[u8] = match param.flat() {
+            scrust_value::FlatRef::L1(b) => b,
+            scrust_value::FlatRef::U16(_) => b"",
+        };
+        match key {
+            b"color" => self.color = wrap_clamp(value + if change { self.color } else { 0.0 }, 0.0, 100.0),
+            b"saturation" => self.saturation = clamp100(value + if change { self.saturation } else { 0.0 }),
+            b"brightness" => self.brightness = clamp100(value + if change { self.brightness } else { 0.0 }),
+            b"transparency" => self.transparency = clamp100(value + if change { self.transparency } else { 0.0 }),
+            _ => {}
         }
         self.update_color();
     }
 
     fn legacy_update(&mut self) {
+        self.resolve();
         let mut rgb = hsv_to_rgb(self.color * 360.0 / 100.0, 1.0, 1.0);
         let shade = if self.legacy_shade > 100.0 { 200.0 - self.legacy_shade } else { self.legacy_shade };
         if shade < 50.0 {
@@ -103,7 +139,8 @@ impl World {
         if !self.target(t).pen.down || self.renderer.is_none() {
             return;
         }
-        let tg = self.target(t);
+        let tg = self.target_mut(t);
+        tg.pen.sync_rgba();
         let (pen, x, y) = (tg.pen.clone(), tg.x, tg.y);
         if let Some(r) = self.renderer.as_mut() {
             r.pen_line(&pen, ox, oy, x, y);
@@ -124,9 +161,14 @@ impl World {
         }
     }
 
+    #[inline]
     pub fn pen_down(&mut self, me: TargetRef) {
         self.target_mut(me).pen.down = true;
-        let tg = self.target(me);
+        if self.renderer.is_none() {
+            return;
+        }
+        let tg = self.target_mut(me);
+        tg.pen.sync_rgba();
         let (pen, x, y) = (tg.pen.clone(), tg.x, tg.y);
         if let Some(r) = self.renderer.as_mut() {
             r.pen_line(&pen, x, y, x, y);
@@ -134,20 +176,16 @@ impl World {
         }
     }
 
+    #[inline]
     pub fn pen_up(&mut self, me: TargetRef) {
         self.target_mut(me).pen.down = false;
     }
 
     pub fn pen_set_color(&mut self, me: TargetRef, color: Value) {
         let rgba = to_rgba(&color);
-        let (h, s, v) = rgb_to_hsv([rgba[0] as f64, rgba[1] as f64, rgba[2] as f64]);
         let pen = &mut self.target_mut(me).pen;
-        pen.color = (h / 360.0) * 100.0;
-        pen.saturation = s * 100.0;
-        pen.brightness = v * 100.0;
-        pen.transparency = 100.0 * (1.0 - (rgba[3] as f64 / 255.0));
-        pen.legacy_shade = pen.brightness / 2.0;
-        pen.update_color();
+        pen.pending_rgba = Some(rgba);
+        pen.rgba_stale = true;
     }
 
     pub fn pen_change_param(&mut self, me: TargetRef, param: JsStr, value: f64) {
@@ -189,6 +227,7 @@ impl World {
 
     pub fn pen_set_shade(&mut self, me: TargetRef, shade: f64) {
         let pen = &mut self.target_mut(me).pen;
+        pen.resolve();
         let mut s = shade % 200.0;
         if s < 0.0 {
             s += 200.0;
@@ -198,6 +237,7 @@ impl World {
     }
 
     pub fn pen_change_shade(&mut self, me: TargetRef, shade: f64) {
+        self.target_mut(me).pen.resolve();
         let cur = self.target(me).pen.legacy_shade;
         self.pen_set_shade(me, cur + shade);
     }

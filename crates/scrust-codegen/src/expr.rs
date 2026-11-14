@@ -10,6 +10,8 @@ use scrust_value::{JsStr, ToBool, ToNum, ToStr, Value};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RT {
     Num,
+    /// `f64` that is `""` when it holds `F64E_EMPTY` (`Repr::F64E`).
+    NumE,
     Str,
     Bool,
     Val,
@@ -27,13 +29,16 @@ pub struct E {
     pub place: Option<String>,
     /// An empty input slot.
     pub missing: bool,
-    /// Typed accessors for list items: (as number, as string).
-    pub alt: Option<(String, String)>,
+    /// Typed accessors for list items: (as number, as string, as `F64E`).
+    pub alt: Option<(String, String, String)>,
 }
 
 pub struct Cx {
     pub owner: Owner,
     pub ti: usize,
+    /// Parameters that arrive as plain numbers in this procedure variant
+    /// (bit `i`: parameter `i`, see `Gen::call`).
+    pub num_params: u64,
 }
 
 pub fn f64_lit(x: f64) -> String {
@@ -100,10 +105,12 @@ impl E {
         if let Some(v) = &self.lit {
             return f64_lit(v.to_num());
         }
-        if let Some((n, _)) = &self.alt {
+        if let Some((n, _, _)) = &self.alt {
             return n.clone();
         }
         match self.rt {
+            // `""` (a NaN) becomes 0 like any NaN.
+            RT::NumE => format!("nn({})", self.code),
             RT::Num => {
                 if self.ty.has(Ty::NAN) {
                     format!("nn({})", self.code)
@@ -129,6 +136,7 @@ impl E {
         }
         match self.rt {
             RT::Num => self.code.clone(),
+            RT::NumE => format!("f64e_num({})", self.code),
             RT::Bool => format!("(({}) as u8 as f64)", self.code),
             RT::Str | RT::Val => match &self.place {
                 Some(p) => format!("{}.js_number()", p),
@@ -145,11 +153,12 @@ impl E {
         if let Some(v) = &self.lit {
             return str_lit(&v.to_str());
         }
-        if let Some((_, s)) = &self.alt {
+        if let Some((_, s, _)) = &self.alt {
             return s.clone();
         }
         match self.rt {
             RT::Str => self.code.clone(),
+            RT::NumE => format!("f64e_str({})", self.code),
             RT::Num => format!("js_num_to_str({})", self.code),
             RT::Bool => format!("({}).to_str()", self.code),
             RT::Val => match &self.place {
@@ -169,7 +178,8 @@ impl E {
         }
         match self.rt {
             RT::Bool => self.code.clone(),
-            RT::Num => format!("({}).to_bool()", self.code),
+            // NaN, and so `""`, is false.
+            RT::Num | RT::NumE => format!("({}).to_bool()", self.code),
             RT::Str | RT::Val => match &self.place {
                 Some(p) => format!("{}.to_bool()", p),
                 None => format!("({}).to_bool()", self.code),
@@ -188,6 +198,7 @@ impl E {
         match self.rt {
             RT::Val => self.code.clone(),
             RT::Num => format!("Value::Num({})", self.code),
+            RT::NumE => format!("f64e_val({})", self.code),
             RT::Str => format!("Value::Str({})", self.code),
             RT::Bool => format!("Value::Bool({})", self.code),
         }
@@ -204,7 +215,24 @@ impl E {
                 }
                 match self.rt {
                     RT::Num => self.code.clone(),
+                    RT::NumE => format!("f64e_num({})", self.code),
                     _ => format!("<f64 as Elem>::from_value(&{})", self.val()),
+                }
+            }
+            Repr::F64E => {
+                if let Some(v) = &self.lit {
+                    return match v {
+                        Value::Str(s) if s.is_empty() => "F64E_EMPTY".into(),
+                        _ => f64_lit(v.js_number()),
+                    };
+                }
+                if let Some((_, _, e)) = &self.alt {
+                    return e.clone();
+                }
+                match self.rt {
+                    RT::Num | RT::NumE => self.code.clone(),
+                    RT::Str => format!("f64e_from_str(&{})", self.code),
+                    _ => format!("f64e_from_value(&{})", self.val()),
                 }
             }
             Repr::Str => self.str(),
@@ -235,6 +263,7 @@ impl E {
 fn rt_of(r: Repr) -> RT {
     match r {
         Repr::F64 => RT::Num,
+        Repr::F64E => RT::NumE,
         Repr::Bool => RT::Bool,
         Repr::Str => RT::Str,
         Repr::Val => RT::Val,
@@ -271,7 +300,7 @@ impl<'a> Gen<'a> {
         };
         let rt = rt_of(repr);
         match repr {
-            Repr::F64 | Repr::Bool => E::new(place, rt, ty),
+            Repr::F64 | Repr::F64E | Repr::Bool => E::new(place, rt, ty),
             Repr::Str | Repr::Val => E { code: format!("{}.clone()", place), rt, ty, lit: None, place: Some(place), missing: false, alt: None },
         }
     }
@@ -298,7 +327,8 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        let numeric = idx.rt == RT::Num || matches!(idx.lit, Some(Value::Num(_)));
+        // `""` is index 0 (invalid), like `nn` of the NaN that encodes it.
+        let numeric = idx.rt == RT::Num || idx.rt == RT::NumE || matches!(idx.lit, Some(Value::Num(_)));
         if numeric && idx.lit.is_none() || matches!(idx.lit, Some(Value::Num(_))) {
             (format!("let i_ = {}; let n_ = {};", idx.num(), len), "num_to_list_index(i_, n_)".into())
         } else {
@@ -337,6 +367,10 @@ impl<'a> Gen<'a> {
             }
             Expr::VarOf(v) => self.storage_read(self.var_place(*v, cx, true, false), Node::Var(*v)),
             Expr::Arg(i) => match cx.owner.proc() {
+                Some(p) if *i < 64 && cx.num_params & (1 << i) != 0 => {
+                    let t = self.an.read_ty(Node::Param(p, *i)) & Ty::NUMBER_OR_NAN;
+                    E::new(format!("a{}", i), RT::Num, if t.is_empty() { Ty::NUMBER_OR_NAN } else { t })
+                }
                 Some(p) => self.storage_read(format!("a{}", i), Node::Param(p, *i)),
                 None => E::lit(Value::Num(0.0)),
             },
@@ -348,7 +382,7 @@ impl<'a> Gen<'a> {
                 let (pre, ix) = self.list_index(&i, &place, 0, false);
                 let ty = self.an.ty_of(e, cx.owner);
                 let mk = |m: &str| format!("{{ {} let ix_ = {}; {}.{}(ix_) }}", pre, ix, place, m);
-                E { code: mk("item"), rt: RT::Val, ty, lit: None, place: None, missing: false, alt: Some((mk("item_num"), mk("item_str"))) }
+                E { code: mk("item"), rt: RT::Val, ty, lit: None, place: None, missing: false, alt: Some((mk("item_num"), mk("item_str"), mk("item_f64e"))) }
             }
             Expr::ListIndexOf(l, item) => {
                 let place = self.list_place(*l, cx, false);
@@ -406,7 +440,7 @@ impl<'a> Gen<'a> {
             for (l, k) in [(0, 1), (1, 0)] {
                 if let (Expr::Op(Op::LetterOf, la, None), Some(Value::Str(c))) = (&args[l], fold(&args[k])) {
                     let lit = E::lit(Value::Str(c.clone()));
-                    if c.len() == 1 && lit.ty.within(Ty::STR_NAN | Ty::STR_BOOL) {
+                    if c.len() == 1 && lit.ty.within(Ty::STR_NAN | Ty::STR_EMPTY | Ty::STR_BOOL) {
                         let (n, st) = (self.expr(&la[0], cx), self.expr(&la[1], cx));
                         let code = format!("letter_eq_ci({}, &{}, {})", n.num(), st.str(), c.code_unit(0));
                         return E::new(code, RT::Bool, Ty::BOOLEAN);
@@ -472,7 +506,7 @@ impl<'a> Gen<'a> {
                 };
                 // A constant that is certainly not numeric forces the
                 // case-insensitive string comparison.
-                let text_const = |x: &E| !x.missing && matches!(&x.lit, Some(Value::Str(_))) && x.ty.within(Ty::STR_NAN | Ty::STR_BOOL);
+                let text_const = |x: &E| !x.missing && matches!(&x.lit, Some(Value::Str(_))) && x.ty.within(Ty::STR_NAN | Ty::STR_EMPTY | Ty::STR_BOOL);
                 let generic = |xs: &[E]| {
                     let usable = |x: &E, other: &E| match &x.place {
                         Some(p) if x.rt == RT::Val && (!p.contains("w.") || !other.uses_world()) => Some(format!("&{}", p)),
@@ -509,6 +543,7 @@ impl<'a> Gen<'a> {
                             None => format!("&{}", x.code),
                         }),
                         RT::Str => Some(format!("&Value::Str({})", x.code)),
+                        RT::NumE => Some(format!("&f64e_val({})", x.code)),
                         _ => None,
                     }
                 };
@@ -547,6 +582,16 @@ impl<'a> Gen<'a> {
                             _ => "num_gt",
                         };
                         format!("{}({}, {})", f, a, b)
+                    }
+                    // A number-or-`""` against a constant: no string is built
+                    // unless the value is `""`.
+                    _ if xs[0].rt == RT::NumE && dyn_val(&xs[0]).is_some() && lit_side(&xs[1]).is_some() => {
+                        let (n, t) = lit_side(&xs[1]).unwrap();
+                        format!("(compare_lit({}, {}, {:?}) {} 0.0)", dyn_val(&xs[0]).unwrap(), f64_lit(n), t, sym)
+                    }
+                    _ if xs[1].rt == RT::NumE && dyn_val(&xs[1]).is_some() && lit_side(&xs[0]).is_some() => {
+                        let (n, t) = lit_side(&xs[0]).unwrap();
+                        format!("(compare_lit({}, {}, {:?}) {} 0.0)", dyn_val(&xs[1]).unwrap(), f64_lit(n), t, flip(sym))
                     }
                     _ if text_const(&xs[1]) && xs[0].lit.is_none() && lit_side(&xs[1]).is_some() => {
                         let (_, t) = lit_side(&xs[1]).unwrap();
@@ -611,7 +656,29 @@ impl<'a> Gen<'a> {
                 };
                 E::new(code, RT::Num, ty)
             }
-            Op::Math(m) => E::new(format!("MathOp::{:?}.apply({})", m, xs[0].num()), RT::Num, ty),
+            // Direct calls: `MathOp::apply` is an out-of-line `match`.
+            Op::Math(m) => {
+                let x = xs[0].num();
+                let code = match m {
+                    MathOp::Abs => format!("f64::abs({x})"),
+                    MathOp::Floor => format!("f64::floor({x})"),
+                    MathOp::Ceiling => format!("f64::ceil({x})"),
+                    MathOp::Sqrt => format!("f64::sqrt({x})"),
+                    // The argument is bound first: it may borrow the world too.
+                    MathOp::Sin => format!("{{ let a_ = {x}; w.sin_deg(a_) }}"),
+                    MathOp::Cos => format!("{{ let a_ = {x}; w.cos_deg(a_) }}"),
+                    MathOp::Tan => format!("ops::tan_deg({x})"),
+                    MathOp::Asin => format!("ops::asin_deg({x})"),
+                    MathOp::Acos => format!("ops::acos_deg({x})"),
+                    MathOp::Atan => format!("ops::atan_deg({x})"),
+                    MathOp::Ln => format!("ops::ln({x})"),
+                    MathOp::Log => format!("ops::log10({x})"),
+                    MathOp::Exp => format!("ops::exp({x})"),
+                    MathOp::Pow10 => format!("ops::pow10({x})"),
+                    MathOp::Unknown => format!("MathOp::Unknown.apply({x})"),
+                };
+                E::new(code, RT::Num, ty)
+            }
             Op::MathDyn => E::new(format!("ops::mathop(&{}, {})", xs[0].str(), xs[1].num()), RT::Num, ty),
         }
     }

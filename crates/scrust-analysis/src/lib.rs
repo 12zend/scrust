@@ -23,6 +23,9 @@ pub struct Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Repr {
     F64,
+    /// `f64` that may also hold `""`, encoded as the NaN `F64E_EMPTY`
+    /// (variables and parameters fed by out-of-range `item of list`).
+    F64E,
     Bool,
     Str,
     Val,
@@ -103,7 +106,7 @@ impl Analysis {
     pub fn read_ty(&self, n: Node) -> Ty {
         let t = self.ty(n);
         match self.reprs.get(&n) {
-            Some(Repr::F64) => t.numeric_image(),
+            Some(Repr::F64) | Some(Repr::F64E) => t.numeric_image(),
             _ => t,
         }
     }
@@ -146,7 +149,7 @@ impl Analysis {
                     }
                     Op::Lt | Op::Eq | Op::Gt | Op::And | Op::Or | Op::Not | Op::Contains => Ty::BOOLEAN,
                     Op::Join => Ty::STRING,
-                    Op::LetterOf => Ty::STR_CINT | Ty::STR_NAN,
+                    Op::LetterOf => Ty::STR_CINT | Ty::STR_NAN | Ty::STR_EMPTY,
                     Op::Length => Ty::POS_INT | Ty::ZERO,
                     Op::Random => {
                         let both = t(0).to_num() | t(1).to_num();
@@ -191,7 +194,7 @@ impl Analysis {
                 R::Str => Ty::STRING,
                 R::Val => Ty::ANY,
             },
-            Expr::ListItem(l, _) => self.read_ty(Node::List(*l)) | Ty::STR_NAN,
+            Expr::ListItem(l, _) => self.read_ty(Node::List(*l)) | Ty::STR_EMPTY,
             Expr::ListIndexOf(..) | Expr::ListLen(_) => Ty::POS_INT | Ty::ZERO,
             Expr::ListContains(..) => Ty::BOOLEAN,
         }
@@ -364,6 +367,12 @@ impl Analysis {
                 Repr::Bool
             } else if t.within(Ty::NUMBER_OR_NAN | Ty::STR_CANON) && self.can_numify(n, t) {
                 Repr::F64
+            } else if t.has(Ty::STR_EMPTY)
+                && t.has(Ty::NUMBER_OR_NAN | Ty::STR_CANON)
+                && t.within(Ty::NUMBER_OR_NAN | Ty::STR_CANON | Ty::STR_EMPTY)
+                && (!t.has(Ty::STR_CANON) || self.can_numify(n, t))
+            {
+                Repr::F64E
             } else if t.within(Ty::STRING) {
                 Repr::Str
             } else {

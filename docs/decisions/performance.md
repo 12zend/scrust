@@ -20,6 +20,14 @@
 | `"Infinity"` (z-buffer initial values) and lists read by `(list contents)` kept storage boxed | `"Infinity"` / `"-Infinity"` are canonical (`str:inf`); `listContents` only looks at string forms, so it is not a kind-sensitive sink (see `kind-sensitivity.md`) |
 | `cos(90)` is CORE-MATH's slowest case; `%` called C `fmod` | exact fast paths, see `math-libm.md` |
 | Variable storage reached through raw pointers that may alias anything, so LLVM reloads every variable after every store and call | synchronous procedures whose bodies cannot reach their storage through the world (no `(var) of (this sprite or the stage)`, no dynamic `(property) of`, no `create clone`, transitively) receive it as `&mut` parameters (`*_na` functions); `SCRUST_ALIASED_STORAGE=1` turns this off |
+| Variables and lists that hold numbers but may also hold `""` (every `item of list` can be `""`: an out-of-range index) were boxed `Value`s | the lattice has `str:empty`; such nodes are `F64E`: an `f64` where `""` is the NaN `F64E_EMPTY`. Numeric reads go through `nn` like any NaN, so the payload never reaches arithmetic; string and raw reads check for it (`f64e_str`, `f64e_val`) |
+| Numbers passed to boxed (`Value` / `JsStr`) parameters were boxed at every call | synchronous procedures get variants taking those parameters as `f64` (`*_s<mask>`), chosen per call site from the argument's static type |
+| `item # of` / `contains` scanning a long list (a tokenizer's vocabulary) | a text key (one `Cast.compare` treats as a string) is looked up in a hash of the items' lower-cased Latin-1 strings, built after a few scans of an unchanged list and kept up to date by `add` |
+| `delete 1 of (list)` (a queue) shifting the whole list | the list keeps a head offset (V8 left-trims arrays the same way), with the slice pointer cached so that reading an item costs what it does in a `Vec` |
+| `switch costume to (name)` comparing every costume name | a hash of the names per sprite |
+| `set pen color to` converting RGB to HSV (two `fmod`s) on every call | the conversion runs when something reads the HSV state or draws; the drawing colour is likewise recomputed only before a line |
+| `MathOp::apply` called (a jump table) for `floor`, `abs`, `sqrt` | each operator is emitted directly; `sin` / `cos` use an inlined copy of musl's kernels with the medium-size argument reduction and a 256-entry per-world memo of recent arguments |
+| Headless `go to` / `change x` going through the fence and pen-line paths | without a renderer `set_xy` only stores the position |
 
 Build settings were measured too: fat LTO with one codegen unit, or thin LTO, changed nothing beyond noise (±3 %), so the generated crate keeps `opt-level = 3`, 16 codegen units and no LTO.
 
@@ -28,9 +36,12 @@ Build settings were measured too: fat LTO with one codegen unit, or thin LTO, ch
 | | native | wasm |
 |---|---|---|
 | a7749fc (before) | 0.76× | 0.58× |
-| now (min of two runs per engine, 22 projects with TurboWarp > 20 ms) | 1.86× | 1.32× |
+| ab43fe5 (min of two runs per engine, 22 projects with TurboWarp > 20 ms) | 1.86× | 1.32× |
+| now (native: min of three runs, interleaved with builds of 0275708, 22 projects) | 2.61× | not remeasured |
 
-Per project, native: 3.4–4.5× on Bob-omb 3D, Greedy meshing, Tipsify Sort and Zend Space, about 2× on FLOW, Goopy, Planet Gen, reflections, Image Editor and the BSP rasterizer, 1.2–1.8× on the other raycasters and simulations, and parity on sub-millisecond frames (Mandelbrot, Conway).
+The native builds are 1.42× faster than 0275708's on the same set (geometric mean of the interleaved runs; 0275708 measured 1.99× TurboWarp in those runs). Per project: 4.7× on MoE (vocabulary lookups), about 2× on Bob-omb 3D, Lambda Engine, the BBC Micro emulator and Image Editor, 1.5–1.8× on Planet Gen, the terrain renderer and the BSP rasterizer, 1.1–1.3× on most numeric engines, and unchanged on FLIP, Goopy and Supper, whose time is in plain floating-point code and list reads.
+
+At ab43fe5, per project, native: 3.4–4.5× on Bob-omb 3D, Greedy meshing, Tipsify Sort and Zend Space, about 2× on FLOW, Goopy, Planet Gen, reflections, Image Editor and the BSP rasterizer, 1.2–1.8× on the other raycasters and simulations, and parity on sub-millisecond frames (Mandelbrot, Conway).
 
 Per project the range is wide: string- and list-heavy projects (texture loaders, tokenizers, emulators) gain the most, numeric loops the least, because V8 compiles those to code close to LLVM's and both spend the same time in correctly rounded `sin`/`cos` (CORE-MATH natively; V8 calls LLVM libc).
 

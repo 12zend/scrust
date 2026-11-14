@@ -37,6 +37,9 @@ impl Ty {
     /// `"Infinity"` / `"-Infinity"`: `String(Number(s)) === s`, and every
     /// block treats them like the numbers (`isInt`, list indices, display).
     pub const STR_CINF: Ty = Ty(1 << 17);
+    /// `""`: like `STR_NAN` for comparisons, but `Number("")` is 0. Out of
+    /// range list items and letters are `""`.
+    pub const STR_EMPTY: Ty = Ty(1 << 18);
 
     pub const INF: Ty = Ty(Self::POS_INF.0 | Self::NEG_INF.0);
     pub const FRACT: Ty = Ty(Self::POS_FRACT.0 | Self::NEG_FRACT.0);
@@ -47,7 +50,7 @@ impl Ty {
     pub const NUMBER: Ty = Ty(Self::FINITE.0 | Self::INF.0);
     pub const NUMBER_OR_NAN: Ty = Ty(Self::NUMBER.0 | Self::NAN.0);
     pub const STR_CANON: Ty = Ty(Self::STR_CINT.0 | Self::STR_CFRACT.0 | Self::STR_CSHORT.0 | Self::STR_CINF.0);
-    pub const STRING: Ty = Ty(Self::STR_CANON.0 | Self::STR_NUM.0 | Self::STR_NAN.0 | Self::STR_BOOL.0);
+    pub const STRING: Ty = Ty(Self::STR_CANON.0 | Self::STR_NUM.0 | Self::STR_NAN.0 | Self::STR_BOOL.0 | Self::STR_EMPTY.0);
     pub const BOOLEAN: Ty = Ty(Self::BOOL_T.0 | Self::BOOL_F.0);
     pub const ANY: Ty = Ty(Self::NUMBER_OR_NAN.0 | Self::STRING.0 | Self::BOOLEAN.0);
 
@@ -78,6 +81,8 @@ impl Ty {
                     let lower = s.to_lower();
                     if lower.eq_str("true") || lower.eq_str("false") {
                         Ty::STR_BOOL
+                    } else if s.is_empty() {
+                        Ty::STR_EMPTY
                     } else {
                         Ty::STR_NAN
                     }
@@ -128,7 +133,7 @@ impl Ty {
     /// Type of `Cast.toNumber(x)` for `x: self` (never contains NaN).
     pub fn to_num(self) -> Ty {
         let mut r = Ty(self.0 & Ty::NUMBER.0);
-        if self.has(Ty::NAN) || self.has(Ty::STR_NAN) || self.has(Ty::STR_BOOL) || self.has(Ty::BOOL_F) {
+        if self.has(Ty::NAN) || self.has(Ty::STR_NAN) || self.has(Ty::STR_EMPTY) || self.has(Ty::STR_BOOL) || self.has(Ty::BOOL_F) {
             r |= Ty::ZERO;
         }
         if self.has(Ty::BOOL_T) {
@@ -208,9 +213,9 @@ impl Not for Ty {
 
 impl std::fmt::Debug for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const NAMES: [&str; 18] = [
+        const NAMES: [&str; 19] = [
             "+inf", "+int", "+fract", "0", "-0", "-int", "-fract", "-inf", "NaN", "str:int", "str:fract", "str:num", "str:text", "str:bool",
-            "true", "false", "str:fract2", "str:inf",
+            "true", "false", "str:fract2", "str:inf", "str:empty",
         ];
         if *self == Ty::ANY {
             return write!(f, "any");
@@ -322,7 +327,7 @@ mod tests {
         assert_eq!(s("infinity"), Ty::STR_NAN);
         assert_eq!(s("+Infinity"), Ty::STR_NUM);
         assert_eq!(s("007"), Ty::STR_NUM);
-        assert_eq!(s(""), Ty::STR_NAN);
+        assert_eq!(s(""), Ty::STR_EMPTY);
         assert_eq!(s("  "), Ty::STR_NAN);
         assert_eq!(s("abc"), Ty::STR_NAN);
         assert_eq!(s("TRUE"), Ty::STR_BOOL);

@@ -171,7 +171,7 @@ fn threads_clones_and_stop_all() {
     let mut live = Vec::new();
     run_headless(&mut w, 12, |w| live.push((w.live_threads(), w.order.len())));
     let g = w.globals::<L0>();
-    let entries: Vec<String> = g.log.items.iter().map(|v| v.to_str().to_rust_string()).collect();
+    let entries: Vec<String> = g.log.items().iter().map(|v| v.to_str().to_rust_string()).collect();
     // Clones are born with the id at clone time; clone 2 has deleted itself before the broadcast.
     assert_eq!(&entries[..4], ["clone 1", "clone 2", "clone 3", "cloned"]);
     assert_eq!(entries.iter().filter(|e| e.starts_with("recv")).count(), 3);
