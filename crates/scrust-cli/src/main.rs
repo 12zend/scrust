@@ -254,6 +254,18 @@ fn cargo_build(c: &Cli, dir: &Path, crate_name: &str) -> Result<PathBuf, String>
         // not be the `cargo` found first on PATH.
         (true, Some((cargo, rustc))) => {
             let mut cmd = Command::new(cargo);
+            // The toolchain's linker (rust-lld) loads libLLVM from the
+            // toolchain's lib/ through the library path that rustup's proxies
+            // set; the binaries called directly need it set here.
+            if let Some(lib) = Path::new(&rustc).parent().and_then(Path::parent).map(|t| t.join("lib")) {
+                for var in ["DYLD_FALLBACK_LIBRARY_PATH", "LD_LIBRARY_PATH"] {
+                    let mut paths = vec![lib.clone()];
+                    paths.extend(std::env::var_os(var).iter().flat_map(std::env::split_paths));
+                    if let Ok(joined) = std::env::join_paths(paths) {
+                        cmd.env(var, joined);
+                    }
+                }
+            }
             cmd.env("RUSTC", rustc);
             cmd
         }

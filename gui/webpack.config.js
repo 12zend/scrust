@@ -1,12 +1,19 @@
 // Builds TurboWarp's scratch-gui editor with `scratch-vm` and `scratch-render`
 // resolved to the scrust packages in ./packages. Run from vendor/scratch-gui
 // (see scripts/build.js) so that the GUI's own relative paths resolve.
+//
+// SCRUST_GUI_TARGET=web builds the browser version (./web) into build-web/;
+// otherwise the Electron app's page goes to build/. TurboWarp's routing
+// expects the editor at <root>editor.html in both.
 
 const path = require('path');
 
 const GUI = path.resolve(__dirname, 'vendor', 'scratch-gui');
 const guiRequire = name => require(path.join(GUI, 'node_modules', name));
 const HtmlWebpackPlugin = guiRequire('html-webpack-plugin');
+const webpack = guiRequire('webpack');
+
+const WEB = process.env.SCRUST_GUI_TARGET === 'web';
 
 // The first configuration is the playground (editor, player, ...).
 const base = require(path.join(GUI, 'webpack.config.js'))[0];
@@ -14,10 +21,10 @@ const base = require(path.join(GUI, 'webpack.config.js'))[0];
 module.exports = Object.assign({}, base, {
     context: GUI,
     entry: {
-        'scrust-editor': path.resolve(__dirname, 'src', 'entry.js')
+        'scrust-editor': WEB ? path.resolve(__dirname, 'web', 'entry.js') : path.resolve(__dirname, 'src', 'entry.js')
     },
     output: Object.assign({}, base.output, {
-        path: path.resolve(__dirname, 'build')
+        path: path.resolve(__dirname, WEB ? 'build-web' : 'build')
     }),
     resolve: Object.assign({}, base.resolve, {
         alias: Object.assign({}, base.resolve.alias, {
@@ -43,6 +50,9 @@ module.exports = Object.assign({}, base, {
                 root: '',
                 meta: {},
                 APP_NAME: 'scrust'
+            }),
+            new webpack.DefinePlugin({
+                'process.env.SCRUST_COMPILER_URL': JSON.stringify(process.env.SCRUST_COMPILER_URL || '')
             })
         ])
 });

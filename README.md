@@ -28,7 +28,7 @@ Options: `--fps N` (default 30), `--turbo`, `--warp-timer` / `--compat=strict`, 
 
 ## GUI
 
-[gui/](gui/README.md) is TurboWarp's scratch-gui in Electron with scratch-vm's execution and scratch-render replaced by scrust: the green flag compiles the project to a native program and draws its frames on the stage. See [docs/decisions/gui.md](docs/decisions/gui.md).
+[gui/](gui/README.md) is TurboWarp's scratch-gui in Electron with scratch-vm's execution and scratch-render replaced by scrust: the green flag compiles the project to a native program and draws its frames on the stage. A browser build (`npm run build:web`) runs the same editor without Electron: the stage is drawn by the scene compiled to WebAssembly and the green flag has a compile server (local by default) build the project for wasm32, which then runs in the page. See [docs/decisions/gui.md](docs/decisions/gui.md).
 
 ## Crates
 
@@ -43,6 +43,7 @@ Options: `--fps N` (default 30), `--turbo`, `--warp-timer` / `--compat=strict`, 
 | `scrust-render` | Metal (macOS) and CPU compositors, collision, pen, bubbles, monitors |
 | `scrust-player` | native window + audio, web host, embedded host for the GUI (`--embed`) |
 | `scrust-node` | Node-API addon over `scrust-render`'s scene, the GUI's stage renderer |
+| `scrust-scene-wasm` | the same scene as a WebAssembly module, for the GUI's browser build |
 | `scrust-cli` | the `scrust` command |
 
 ## Status

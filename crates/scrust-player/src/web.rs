@@ -8,10 +8,15 @@ use scrust_runtime::{set_world_ptr, Audio, Options, ProgramDef, TargetRef, World
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+// Imports from the page (`env`); naming the module makes them wasm imports
+// instead of symbols the linker must find.
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn js_sound_play(id: u32, sprite: u32, sound: u32, volume: f64, rate: f64, pan: f64);
     fn js_sound_stop(id: u32);
     fn js_sound_set(id: u32, volume: f64, rate: f64, pan: f64);
+    /// A panic message (UTF-8); the module traps right after.
+    fn js_panic(ptr: *const u8, len: u32);
 }
 
 struct State {
@@ -22,6 +27,8 @@ struct State {
     epoch_offset: f64,
     now: Rc<Cell<f64>>,
     scratch: Vec<u8>,
+    /// The last `scrust_state` snapshot.
+    state_json: String,
 }
 
 thread_local! {
@@ -113,6 +120,11 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
 }
 
 pub fn init(program: ProgramDef, mut options: Options, scale: f64, seed: u32, epoch_ms: f64, tz_offset_min: f64) {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        // SAFETY: plain FFI call into the page's glue code; it copies the bytes.
+        unsafe { js_panic(msg.as_ptr(), msg.len() as u32) };
+    }));
     let program: &'static ProgramDef = Box::leak(Box::new(program));
     PROGRAM.with(|p| p.set(Some(program)));
     options.seed = seed;
@@ -131,7 +143,7 @@ pub fn init(program: ProgramDef, mut options: Options, scale: f64, seed: u32, ep
     world.audio = Some(Box::new(WebAudio));
     set_world_ptr(&mut *world);
     world.green_flag();
-    STATE.with(|s| *s.borrow_mut() = Some(State { world, rgba: vec![255; size], next_tick: 0.0, epoch_offset: epoch_ms, now, scratch: Vec::new() }));
+    STATE.with(|s| *s.borrow_mut() = Some(State { world, rgba: vec![255; size], next_tick: 0.0, epoch_offset: epoch_ms, now, scratch: Vec::new(), state_json: String::new() }));
 }
 
 /// Advance to host time `now_ms` (stepping as many ticks as are due, at most
@@ -229,6 +241,28 @@ pub extern "C" fn scrust_green_flag() {
 #[no_mangle]
 pub extern "C" fn scrust_stop() {
     with(|st| st.world.stop_all());
+}
+
+/// Number of running threads (the GUI lights its green flag while > 0).
+#[no_mangle]
+pub extern "C" fn scrust_threads() -> u32 {
+    with(|st| st.world.live_threads() as u32).unwrap_or(0)
+}
+
+/// Take a state snapshot (`crate::state`, JSON) and return its length in
+/// bytes; it is at `scrust_state_ptr` until the next snapshot.
+#[no_mangle]
+pub extern "C" fn scrust_state() -> u32 {
+    with(|st| {
+        st.state_json = crate::state::to_json(&st.world);
+        st.state_json.len() as u32
+    })
+    .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn scrust_state_ptr() -> *const u8 {
+    with(|st| st.state_json.as_ptr()).unwrap_or(std::ptr::null())
 }
 
 /// Encoded bytes of a sound asset (decoded by the page with Web Audio).

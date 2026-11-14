@@ -1969,6 +1969,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scrust-scene-wasm"
+version = "0.1.0"
+dependencies = [
+ "scrust-render",
+]
+
+[[package]]
 name = "scrust-value"
 version = "0.1.0"
 dependencies = [

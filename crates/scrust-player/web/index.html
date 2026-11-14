@@ -46,6 +46,11 @@
     return decoded.get(key);
   };
   const env = {
+    js_panic (ptr, len) {
+      const msg = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ptr, len));
+      console.error('scrust: ' + msg);
+      status.textContent = 'stopped: ' + msg;
+    },
     js_sound_play (id, sprite, sound, volume, rate, pan) {
       const ctx = ensureAudio();
       if (!ctx) { queueMicrotask(() => ex.scrust_sound_done(id)); return; }

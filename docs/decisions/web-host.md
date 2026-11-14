@@ -6,6 +6,8 @@ Reasons: no extra tooling (wasm-bindgen CLI versions must match the crate), the 
 
 Fonts are compiled into every build (see `fonts.md`). On the web there are no system fonts, so characters outside the embedded fonts' coverage (e.g. CJK) are not drawn there.
 
-The wasm standard library comes from a rustup toolchain; when rustup is installed the CLI builds wasm targets with `rustup which cargo` / `rustc` even if another `cargo` is first on `PATH`.
+The wasm standard library comes from a rustup toolchain; when rustup is installed the CLI builds wasm targets with `rustup which cargo` / `rustc` even if another `cargo` is first on `PATH`. Called directly (not through rustup's proxies), the toolchain's `rust-lld` cannot find `libLLVM`, so the CLI puts the toolchain's `lib/` on `DYLD_FALLBACK_LIBRARY_PATH` / `LD_LIBRARY_PATH` itself.
+
+The page's functions are declared with `#[link(wasm_import_module = "env")]`: current Rust no longer links `wasm32-unknown-unknown` with undefined symbols allowed, so without the module name they are link errors instead of imports. A panic is reported through `js_panic` before the module traps.
 
 The page fetches a sound's bytes (`scrust_sound_ptr` / `_len`) from inside `js_sound_play`, i.e. while `scrust_frame` holds the host state, so those two exports read the program through a separate thread-local instead of borrowing the state (borrowing it panicked on the first sound).
