@@ -29,6 +29,9 @@ const opts = {
     // Lists longer than this are traced as [{t:'hash', v:'<length>:<fnv1a>'}].
     hashOver: Number(q.get('hashOver') || 0),
     every: Number(q.get('every') || 0),
+    // timing=1: no trace or screenshots; the real time of every
+    // Sequencer.stepThreads call is saved to <project><suffix>.time.json.
+    timing: q.get('timing') === '1',
     shots: new Set((q.get('shots') || '').split(',').filter(Boolean).map(Number))
 };
 const EPOCH = 1577836800000; // harness/trace.js
@@ -72,6 +75,7 @@ const tick = (() => {
     return () => new Promise(r => { queue.push(r); ch.port2.postMessage(0); });
 })();
 const realSetTimeout = window.setTimeout.bind(window);
+const realNow = performance.now.bind(performance);
 const sleep = ms => new Promise(r => realSetTimeout(r, ms));
 
 async function run (name) {
@@ -134,6 +138,20 @@ async function run (name) {
     rt.currentStepTime = interval;
     rt.updateCurrentMSecs();
     rt.ioDevices.clock.resetProjectTimer();
+    const stepMs = [];
+    if (opts.timing) {
+        opts.trace = false;
+        opts.every = 0;
+        opts.shots.clear();
+        const seqr = rt.sequencer;
+        const inner = seqr.stepThreads.bind(seqr);
+        seqr.stepThreads = function () {
+            const t0 = realNow();
+            const r = inner();
+            stepMs.push(realNow() - t0);
+            return r;
+        };
+    }
     vm.greenFlag();
 
     const gl = renderer.gl;
@@ -143,7 +161,7 @@ async function run (name) {
     const fctx = flip.getContext('2d');
     let batch = [];
     let batchChars = 0;
-    await save(`${base}.ref.jsonl`, '');
+    if (opts.trace) await save(`${base}.ref.jsonl`, '');
     for (let frame = 1; frame <= opts.frames; frame++) {
         now += interval;
         await tick();
@@ -194,6 +212,7 @@ async function run (name) {
         }
     }
     if (batch.length) await save(`${base}.ref.jsonl`, batch.join('\n') + '\n', true);
+    if (opts.timing) await save(`${base}.time.json`, JSON.stringify({engine: 'turbowarp', frames: opts.frames, step: stepMs}));
     if (rngSites) await save(`${base}.rng.json`, JSON.stringify(rngSites, null, 1));
     await save(`${base}.done`, `${opts.frames} frames`);
 }
@@ -201,7 +220,7 @@ async function run (name) {
 (async () => {
     if (list.length === 1 && list[0] === '*') list = await (await fetch('/list')).json();
     if (index < list.length && q.get('redo') !== '1') {
-        const base = list[index].replace(/\.sb3$/, '').replace(/[^\w.-]+/g, '_');
+        const base = list[index].replace(/\.sb3$/, '').replace(/[^\w.-]+/g, '_') + (q.get('suffix') || '');
         const done = await fetch(`/r/${encodeURIComponent(base)}.done`);
         const failed = await fetch(`/r/${encodeURIComponent(base)}.error`);
         if (done.ok || failed.ok) { q.set('i', String(index + 1)); location.search = q.toString(); return; }
@@ -212,7 +231,7 @@ async function run (name) {
     try {
         await run(name);
     } catch (e) {
-        const base = name.replace(/\.sb3$/, '').replace(/[^\w.-]+/g, '_');
+        const base = name.replace(/\.sb3$/, '').replace(/[^\w.-]+/g, '_') + (q.get('suffix') || '');
         await save(`${base}.error`, String(e && e.stack || e));
     }
     if (q.get('hold')) { log('held'); return; }

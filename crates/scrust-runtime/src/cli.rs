@@ -15,11 +15,15 @@ pub struct Args {
     pub bench: bool,
     pub print_say: bool,
     pub virtual_audio: bool,
+    /// `--bench-json`: print the time of every frame (ms) as JSON on stdout.
+    pub bench_json: bool,
+    /// `--bench-budget MS`: with `--bench-json`, stop once this much time was spent.
+    pub bench_budget_ms: f64,
 }
 
 /// Parse the common run-time flags. Unknown flags are returned untouched.
 pub fn parse_args(mut options: Options, argv: &[String]) -> (Args, Vec<String>) {
-    let mut a = Args { options: options.clone(), trace: None, trace_every: 1, frames: None, bench: false, print_say: false, virtual_audio: false };
+    let mut a = Args { options: options.clone(), trace: None, trace_every: 1, frames: None, bench: false, print_say: false, virtual_audio: false, bench_json: false, bench_budget_ms: f64::INFINITY };
     let mut rest = Vec::new();
     let mut i = 0;
     let next = |i: &mut usize| -> Option<String> {
@@ -39,6 +43,8 @@ pub fn parse_args(mut options: Options, argv: &[String]) -> (Args, Vec<String>) 
             "--warp-timer" => options.warp_timer = true,
             "--answers" => options.answers = next(&mut i).map(|v| v.split('|').map(String::from).collect()).unwrap_or_default(),
             "--bench" => a.bench = true,
+            "--bench-json" => a.bench_json = true,
+            "--bench-budget" => a.bench_budget_ms = next(&mut i).and_then(|v| v.parse().ok()).unwrap_or(f64::INFINITY),
             "--print-say" => a.print_say = true,
             "--virtual-audio" => a.virtual_audio = true,
             other => rest.push(other.to_string()),
@@ -87,6 +93,10 @@ pub fn main_with_args(program: ProgramDef, defaults: Options, argv: &[String]) {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let started = std::time::Instant::now();
+    if args.bench_json {
+        bench_json(&mut w, frames, args.bench_budget_ms);
+        return;
+    }
     let mut last_say: Vec<String> = Vec::new();
     let print_say = args.print_say;
     let realtime = !args.options.deterministic && args.trace.is_none() && args.frames.is_none();
@@ -139,4 +149,30 @@ pub fn main_with_args(program: ProgramDef, defaults: Options, argv: &[String]) {
     if args.bench {
         eprintln!("frames: {}  elapsed: {:.3} ms", done_frames, started.elapsed().as_secs_f64() * 1000.0);
     }
+}
+
+/// `--bench-json`: green flag, then step `frames` frames (or until `budget_ms`
+/// is spent), timing each step; prints `{"step":[ms, ...]}`.
+#[cfg(not(target_arch = "wasm32"))]
+fn bench_json(w: &mut Box<World>, frames: u64, budget_ms: f64) {
+    let wp: *mut World = &mut **w;
+    let mut times: Vec<f64> = Vec::new();
+    let mut total = 0.0;
+    // SAFETY: the world is only accessed through `wp` from here on.
+    unsafe {
+        crate::world::set_world_ptr(wp);
+        (*wp).green_flag();
+        for _ in 0..frames {
+            let t0 = std::time::Instant::now();
+            crate::sched::step(wp);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            times.push(ms);
+            total += ms;
+            if total > budget_ms {
+                break;
+            }
+        }
+    }
+    let list: Vec<String> = times.iter().map(|t| format!("{t:.4}")).collect();
+    println!("{{\"step\":[{}]}}", list.join(","));
 }
