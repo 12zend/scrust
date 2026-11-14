@@ -123,3 +123,28 @@ fn compare_val_str_matches_reference() {
         }
     }
 }
+
+#[test]
+fn string_constant_comparisons_match_reference() {
+    let texts = ["", " ", "\t", "a", "A", "b", "z", "Z", "é", "É", ".", "ab", "AB", "abc", "İ", "σ", "Σ", "0", "x y"];
+    for a in texts {
+        let sa = JsStr::from(a);
+        for t in texts {
+            if !t.is_ascii() {
+                continue;
+            }
+            let t: &'static str = Box::leak(t.to_string().into_boxed_str());
+            let want = scrust_value::compare_str_ci(&sa, &JsStr::from(t));
+            let got = scrust_value::compare_str_ci_lit(&sa, t);
+            assert_eq!(want.partial_cmp(&0.0), got.partial_cmp(&0.0), "{a:?} vs {t:?}");
+        }
+        for c in texts.iter().filter(|c| c.encode_utf16().count() == 1) {
+            let cu = c.encode_utf16().next().unwrap();
+            for i in 0..=a.encode_utf16().count() + 1 {
+                let letter = scrust_value::ops::letter_of(i as f64, &sa);
+                let want = scrust_value::compare_str_ci(&letter, &JsStr::from(*c)) == 0.0;
+                assert_eq!(scrust_value::letter_eq_ci(i as f64, &sa, cu), want, "letter {i} of {a:?} = {c:?}");
+            }
+        }
+    }
+}

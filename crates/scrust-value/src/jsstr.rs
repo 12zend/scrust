@@ -99,6 +99,8 @@ struct Node {
     /// `Number(this)` once computed (bits; `NUM_UNKNOWN` before). Strings
     /// are immutable, so like V8's cached array index this never goes stale.
     num: Cell<u64>,
+    /// `isNotActuallyZero` once computed: 0 unknown, 1 false, 2 true.
+    naz: Cell<u8>,
     repr: Repr,
 }
 
@@ -129,8 +131,8 @@ impl Drop for Node {
 pub struct JsStr(Rc<Node>);
 
 thread_local! {
-    static EMPTY: JsStr = JsStr::new_flat(Flat::L1(Box::new([])));
-    static SINGLE: Vec<JsStr> = (0..=255u8).map(|c| JsStr::new_flat(Flat::L1(Box::new([c])))).collect();
+    static EMPTY: JsStr = JsStr::new_flat(Flat::Small(0, [0; SMALL]));
+    static SINGLE: Vec<JsStr> = (0..=255u8).map(|c| JsStr::new_flat(Flat::l1(&[c]))).collect();
 }
 
 impl JsStr {
@@ -140,7 +142,7 @@ impl JsStr {
             Flat::U16(s) => (s.len(), false),
             Flat::Small(n, _) => (*n as usize, true),
         };
-        JsStr(Rc::new(Node { len, l1, num: Cell::new(NUM_UNKNOWN), repr: Repr::Flat(f) }))
+        JsStr(Rc::new(Node { len, l1, num: Cell::new(NUM_UNKNOWN), naz: Cell::new(0), repr: Repr::Flat(f) }))
     }
 
     #[inline]
@@ -212,6 +214,15 @@ impl JsStr {
         let n = if n.is_nan() { f64::NAN } else { n };
         self.0.num.set(n.to_bits());
         n
+    }
+
+    /// The inline buffer of a short Latin-1 string (length, bytes).
+    #[inline]
+    fn small(&self) -> Option<(usize, &[u8; SMALL])> {
+        match &self.0.repr {
+            Repr::Flat(Flat::Small(n, b)) => Some((*n as usize, b)),
+            _ => None,
+        }
     }
 
     /// True when every code unit is <= 0xFF.
@@ -309,6 +320,18 @@ impl JsStr {
         let len = self.0.len + other.0.len;
         let l1 = self.0.l1 && other.0.l1;
         if len <= ROPE_MIN {
+            if len <= SMALL {
+                if let (Some((al, ab)), Some((_, bb))) = (self.small(), other.small()) {
+                    // Fixed-size copies only: variable-length ones become
+                    // `memory.copy` in wasm, which V8 calls out of line.
+                    let mut tmp = [0u8; 2 * SMALL];
+                    tmp[..SMALL].copy_from_slice(ab);
+                    tmp[al..al + SMALL].copy_from_slice(bb);
+                    let mut buf = [0u8; SMALL];
+                    buf.copy_from_slice(&tmp[..SMALL]);
+                    return JsStr::new_flat(Flat::Small(len as u8, buf));
+                }
+            }
             return match (self.flat(), other.flat()) {
                 (FlatRef::L1(a), FlatRef::L1(b)) if len <= SMALL => {
                     let mut buf = [0u8; SMALL];
@@ -334,6 +357,7 @@ impl JsStr {
             len,
             l1,
             num: Cell::new(NUM_UNKNOWN),
+            naz: Cell::new(0),
             repr: Repr::Cons(Cons {
                 parts: RefCell::new(Some((self.clone(), other.clone()))),
                 flat: OnceCell::new(),
@@ -436,8 +460,20 @@ impl JsStr {
     }
 
     /// TurboWarp's `isNotActuallyZero`: no ASCII digit and no tab.
+    #[inline]
     pub fn is_not_actually_zero(&self) -> bool {
-        !self.flat().units().any(|u| (0x30..=0x39).contains(&u) || u == 9)
+        match self.0.naz.get() {
+            1 => false,
+            2 => true,
+            _ => {
+                let v = match self.flat() {
+                    FlatRef::L1(b) => !b.iter().any(|&u| u.is_ascii_digit() || u == 9),
+                    FlatRef::U16(b) => !b.iter().any(|&u| (0x30..=0x39).contains(&u) || u == 9),
+                };
+                self.0.naz.set(if v { 2 } else { 1 });
+                v
+            }
+        }
     }
 
     pub fn to_utf16(&self) -> Vec<u16> {

@@ -400,6 +400,20 @@ impl<'a> Gen<'a> {
                 return E::lit(Value::Num(a.to_num()));
             }
         }
+        // `(letter i of s) = "c"` for a one-unit text constant: compare the
+        // code unit in place instead of building a string.
+        if let (Op::Eq, None) = (op, order) {
+            for (l, k) in [(0, 1), (1, 0)] {
+                if let (Expr::Op(Op::LetterOf, la, None), Some(Value::Str(c))) = (&args[l], fold(&args[k])) {
+                    let lit = E::lit(Value::Str(c.clone()));
+                    if c.len() == 1 && lit.ty.within(Ty::STR_NAN | Ty::STR_BOOL) {
+                        let (n, st) = (self.expr(&la[0], cx), self.expr(&la[1], cx));
+                        let code = format!("letter_eq_ci({}, &{}, {})", n.num(), st.str(), c.code_unit(0));
+                        return E::new(code, RT::Bool, Ty::BOOLEAN);
+                    }
+                }
+            }
+        }
         let xs: Vec<E> = args.iter().map(|a| self.expr(a, cx)).collect();
         // A non-default evaluation order only matters when it was recorded
         // (both operands consume randomness): evaluate into temporaries.
@@ -533,6 +547,14 @@ impl<'a> Gen<'a> {
                             _ => "num_gt",
                         };
                         format!("{}({}, {})", f, a, b)
+                    }
+                    _ if text_const(&xs[1]) && xs[0].lit.is_none() && lit_side(&xs[1]).is_some() => {
+                        let (_, t) = lit_side(&xs[1]).unwrap();
+                        format!("(compare_str_ci_lit(&{}, {:?}) {} 0.0)", xs[0].str(), t, sym)
+                    }
+                    _ if text_const(&xs[0]) && xs[1].lit.is_none() && lit_side(&xs[0]).is_some() => {
+                        let (_, t) = lit_side(&xs[0]).unwrap();
+                        format!("(compare_str_ci_lit(&{}, {:?}) {} 0.0)", xs[1].str(), t, flip(sym))
                     }
                     _ if text_const(&xs[0]) || text_const(&xs[1]) => {
                         format!("(compare_str_ci(&{}, &{}) {} 0.0)", xs[0].str(), xs[1].str(), sym)

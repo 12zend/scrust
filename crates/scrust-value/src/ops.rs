@@ -18,11 +18,54 @@ pub fn js_mod(n: f64, modulus: f64) -> f64 {
         }
         return if (r < 0) != (mi < 0) { (r + mi) as f64 } else { r as f64 };
     }
-    let mut r = n % modulus;
+    let mut r = fmod(n, modulus);
     if r / modulus < 0.0 {
         r += modulus;
     }
     r
+}
+
+/// JavaScript `%` (C `fmod`), exact. On targets with a fused multiply-add
+/// the remainder `n - q * m` of the truncated quotient is computed exactly
+/// in one instruction (an `fmod` result is always representable); the
+/// quotient is corrected when `n / m` rounded across an integer.
+#[inline]
+pub fn fmod(n: f64, m: f64) -> f64 {
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "fma")))]
+    {
+        if n.is_finite() && m.is_finite() && m != 0.0 {
+            let mut q = (n / m).trunc();
+            if q.abs() < 4.0e15 {
+                let am = m.abs();
+                let step = if m > 0.0 { 1.0 } else { -1.0 };
+                for _ in 0..3 {
+                    let r = (-q).mul_add(m, n);
+                    if n >= 0.0 {
+                        if r < 0.0 {
+                            q -= step;
+                            continue;
+                        }
+                        if r >= am {
+                            q += step;
+                            continue;
+                        }
+                    } else {
+                        if r > 0.0 {
+                            q += step;
+                            continue;
+                        }
+                        if r <= -am {
+                            q -= step;
+                            continue;
+                        }
+                    }
+                    // A zero remainder has the dividend's sign.
+                    return if r == 0.0 { 0.0f64.copysign(n) } else { r };
+                }
+            }
+        }
+    }
+    n % m
 }
 
 #[inline]
@@ -78,13 +121,34 @@ const PI: f64 = core::f64::consts::PI;
 fn round10(x: f64) -> f64 {
     crate::num::js_round(x * 1e10) / 1e10
 }
+
+/// `round10(exact)` from a value `fast` within two ULPs of the correctly
+/// rounded `exact()`: the rounding to ten decimals hides the difference
+/// unless `fast * 1e10` lies next to a half-integer (or `fast` is zero,
+/// whose sign is then unknown), and only then is `exact` computed. The
+/// correctly rounded functions are slow exactly where Scratch projects
+/// call them most: degree arguments like 90 put `cos` next to a zero.
+#[inline]
+fn round10_fast(fast: f64, exact: impl FnOnce() -> f64) -> f64 {
+    let t = fast * 1e10;
+    if fast != 0.0 && t.abs() < 4.0e15 {
+        let d = (t - t.floor() - 0.5).abs();
+        if d > t.abs() * 2e-15 + 1e-9 {
+            return crate::num::js_round(t) / 1e10;
+        }
+    }
+    round10(exact())
+}
+
 #[inline]
 pub fn sin_deg(n: f64) -> f64 {
-    round10(crate::jsmath::sin((PI * n) / 180.0))
+    let r = (PI * n) / 180.0;
+    round10_fast(libm::sin(r), || crate::jsmath::sin(r))
 }
 #[inline]
 pub fn cos_deg(n: f64) -> f64 {
-    round10(crate::jsmath::cos((PI * n) / 180.0))
+    let r = (PI * n) / 180.0;
+    round10_fast(libm::cos(r), || crate::jsmath::cos(r))
 }
 /// TurboWarp's `tan` (jsexecute.js): the angle reduced by `% 360`, exact
 /// infinities at the poles.
@@ -96,7 +160,8 @@ pub fn tan_deg(n: f64) -> f64 {
     if a == -90.0 || a == 270.0 {
         return f64::NEG_INFINITY;
     }
-    round10(crate::jsmath::tan((PI * a) / 180.0))
+    let r = (PI * a) / 180.0;
+    round10_fast(libm::tan(r), || crate::jsmath::tan(r))
 }
 #[inline]
 pub fn asin_deg(n: f64) -> f64 {

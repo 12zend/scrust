@@ -327,7 +327,7 @@ fn compare_num_str(x: f64, s: &JsStr) -> f64 {
 pub fn compare_val_str(a: &Value, s: &JsStr) -> f64 {
     if let Value::Num(x) = a {
         let n2 = js_string_to_number(s);
-        if !x.is_nan() && !n2.is_nan() && n2 != 0.0 {
+        if !x.is_nan() && !n2.is_nan() && (n2 != 0.0 || !s.is_not_actually_zero()) {
             return if *x == n2 { 0.0 } else { x - n2 };
         }
     }
@@ -430,6 +430,11 @@ impl CompareKey {
         if !x.is_nan() && !self.n.is_nan() {
             return x == self.n;
         }
+        // A finite number's string is numeric, the key's is not (or is
+        // whitespace): they cannot be equal.
+        if x.is_finite() {
+            return false;
+        }
         eq_ci(&js_num_to_str(x), &self.s)
     }
 
@@ -472,6 +477,37 @@ fn eq_ci(a: &JsStr, b: &JsStr) -> bool {
         return x.len() == y.len() && x.iter().zip(y).all(|(&c, &d)| c == d || crate::lower::l1_lower(c) == crate::lower::l1_lower(d));
     }
     compare_str_ci(a, b) == 0.0
+}
+
+/// `compare_str_ci(a, text)` for an ASCII constant `text`.
+#[inline]
+pub fn compare_str_ci_lit(a: &JsStr, text: &'static str) -> f64 {
+    if let FlatRef::L1(x) = a.flat() {
+        let t = text.as_bytes();
+        if x.len() == t.len() && x == t {
+            return 0.0;
+        }
+        return ord_to_f64(x.iter().map(|&c| crate::lower::l1_lower(c)).cmp(t.iter().map(|&c| crate::lower::l1_lower(c))));
+    }
+    compare_str_ci(a, &JsStr::from(text))
+}
+
+/// `(letter (letter) of (s)) = c` for a one-unit text constant `c`
+/// (a string comparison, case-insensitive), without building the letter.
+#[inline]
+pub fn letter_eq_ci(letter: f64, s: &JsStr, c: u16) -> bool {
+    let index = letter - 1.0;
+    if index < 0.0 || index >= s.len() as f64 {
+        return false;
+    }
+    let u = s.code_unit(index as usize);
+    if u == c {
+        return true;
+    }
+    if u < 256 && c < 256 {
+        return crate::lower::l1_lower(u as u8) == crate::lower::l1_lower(c as u8);
+    }
+    compare_str_ci(&JsStr::from_unit(u), &JsStr::from_unit(c)) == 0.0
 }
 
 /// Case-insensitive string comparison branch of `Cast.compare`, for callers

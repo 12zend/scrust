@@ -26,7 +26,7 @@ pub mod prelude {
     pub use crate::{val_bool, val_num, val_str};
     pub use scrust_value::ops;
     pub use scrust_value::{
-        compare, compare_lit, compare_str_ci, compare_val_str, js_num_to_str, js_round, num_eq, num_gt, num_lt, num_to_list_index, JsStr, ListIndex, MathOp, ToBool, ToNum, ToStr, ToValue, Value,
+        compare, compare_lit, compare_str_ci, compare_str_ci_lit, compare_val_str, letter_eq_ci, js_num_to_str, js_round, num_eq, num_gt, num_lt, num_to_list_index, JsStr, ListIndex, MathOp, ToBool, ToNum, ToStr, ToValue, Value,
     };
 }
 
@@ -81,13 +81,48 @@ pub fn load_asset(_name: &str) -> &'static [u8] {
     &[]
 }
 
-/// A string constant, interned once per thread.
+/// A string constant of generated code, created on first use.
 #[macro_export]
 macro_rules! jstr {
     ($s:expr) => {{
-        thread_local! { static S: $crate::JsStr = $crate::JsStr::from($s); }
-        S.with(|s| s.clone())
+        static S: $crate::StaticStr = $crate::StaticStr::new($s);
+        S.get()
     }};
+}
+
+/// Storage of a `jstr!` constant.
+///
+/// `JsStr` is reference counted without atomics, so it is not `Sync`; a
+/// thread-local would be the textbook home for it, but on macOS every access
+/// to one is a function call. Generated programs evaluate string constants
+/// only on the thread that steps the world (scripts never run elsewhere;
+/// renderer and audio threads do not touch them), so a static is enough.
+pub struct StaticStr {
+    text: &'static str,
+    cell: std::cell::UnsafeCell<Option<JsStr>>,
+}
+
+// SAFETY: see the type's documentation: only the script thread uses it.
+unsafe impl Sync for StaticStr {}
+
+impl StaticStr {
+    pub const fn new(text: &'static str) -> StaticStr {
+        StaticStr { text, cell: std::cell::UnsafeCell::new(None) }
+    }
+
+    #[inline]
+    pub fn get(&'static self) -> JsStr {
+        // SAFETY: single-threaded use (see the type); the reference to the
+        // cell's contents ends before it is written.
+        unsafe {
+            if let Some(s) = &*self.cell.get() {
+                return s.clone();
+            }
+            let s = JsStr::from(self.text);
+            *self.cell.get() = Some(s.clone());
+            s
+        }
+    }
 }
 
 /// Headless driver: green flag, then run `frames` frames, calling `on_frame`

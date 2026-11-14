@@ -141,6 +141,12 @@ impl<T> Clone for LocalsPtr<T> {
 }
 impl<T> Copy for LocalsPtr<T> {}
 impl<T> LocalsPtr<T> {
+    /// A pointer derived from a `&mut` parameter (generated `noalias`
+    /// procedures: accesses stay based on the parameter).
+    #[inline(always)]
+    pub fn from_mut(r: &mut T) -> Self {
+        LocalsPtr(r)
+    }
     /// Shared access.
     #[inline(always)]
     #[allow(clippy::should_implement_trait)]

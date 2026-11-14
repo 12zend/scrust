@@ -59,6 +59,9 @@ pub struct Gen<'a> {
     /// Layer-2 flow types (§8.5): what a dynamically stored variable is known
     /// to hold at the current program point of the function being emitted.
     pub flow: std::collections::HashMap<VarId, scrust_analysis::Ty>,
+    /// Synchronous procedure variants whose bodies receive their variable
+    /// storage as `&mut` arguments (see `noalias_variants`).
+    noalias: std::collections::HashSet<(ProcId, bool)>,
 }
 
 /// What follows a statement list.
@@ -80,13 +83,16 @@ struct FnCx {
     depth: u8,
     /// Is a `{ let w = world();` block currently open?
     w_open: bool,
+    /// The variable storage came in as `&mut` arguments (`noalias_variants`).
+    noalias: bool,
     is_proc: bool,
     /// Emitting a part function: early exits return `Some(..)`.
     in_part: bool,
 }
 
 pub fn generate(project: &Project, program: &Program, an: &Analysis, opts: &GenOptions) -> Output {
-    let mut g = Gen { project, program, an, opts, out: String::new(), indent: 0, tmp: 0, pending: String::new(), flow: Default::default() };
+    let mut g = Gen { project, program, an, opts, out: String::new(), indent: 0, tmp: 0, pending: String::new(), flow: Default::default(), noalias: Default::default() };
+    g.noalias = g.noalias_variants();
     let mut files = Vec::new();
     let mut assets = Vec::new();
     let mut main = String::new();
@@ -638,7 +644,7 @@ impl<'a> Gen<'a> {
         self.line("    Box::pin(async move {");
         self.indent += 2;
         self.prologue(ti, true);
-        let mut fc = FnCx { cx: Cx { owner, ti }, warp: false, is_async: true, depth: 0, w_open: false, is_proc: false, in_part: false };
+        let mut fc = FnCx { cx: Cx { owner, ti }, warp: false, is_async: true, depth: 0, w_open: false, noalias: false, is_proc: false, in_part: false };
         let body = &self.program.targets[ti].scripts[si].body;
         self.emit_body(body, &mut fc, &format!("t{ti}_s{si}"), &[]);
         self.indent -= 2;
@@ -694,11 +700,18 @@ impl<'a> Gen<'a> {
                 self.line(&format!("fn {name}_part{k}(me: TargetRef{sep}{}) -> Pin<Box<dyn Future<Output = Option<bool>>>> {{", params.join(", ")));
                 self.line("    Box::pin(async move {");
                 self.indent = 2;
+            } else if fc.noalias {
+                self.line(&format!("fn {name}_part{k}(w: &mut World, me: TargetRef, {}{sep}{}) -> Option<bool> {{", Self::na_params(ti), params.join(", ")));
+                self.indent = 1;
             } else {
                 self.line(&format!("fn {name}_part{k}(w: &mut World, me: TargetRef{sep}{}) -> Option<bool> {{", params.join(", ")));
                 self.indent = 1;
             }
-            self.prologue(ti, fc.is_async);
+            if fc.noalias {
+                self.prologue_na(ti);
+            } else {
+                self.prologue(ti, fc.is_async);
+            }
             self.stmts(&body[b..e], fc, if last { Tail::Fn } else { Tail::No });
             self.close_w(fc);
             self.line("None");
@@ -715,6 +728,8 @@ impl<'a> Gen<'a> {
             self.indent = outer_indent;
             if fc.is_async {
                 self.line(&format!("if let Some(r_) = {name}_part{k}(me{args}).await {{ {ret} }}"));
+            } else if fc.noalias {
+                self.line(&format!("if let Some(r_) = {name}_part{k}(w, me, {}{args}) {{ {ret} }}", Self::na_args(ti)));
             } else {
                 self.line(&format!("if let Some(r_) = {name}_part{k}(w, me{args}) {{ {ret} }}"));
             }
@@ -761,6 +776,91 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Synchronous procedure variants that can take their target's and the
+    /// stage's variable storage as `&mut` parameters. LLVM then knows that
+    /// nothing else (runtime calls included) reads or writes those variables
+    /// while the procedure runs, so it keeps them in registers and shares
+    /// repeated list reads. That is only true if no block in the body (or in
+    /// a procedure it calls) reaches the storage through the world: `(var)
+    /// of (this sprite)`, a dynamic `(property) of (object)` and `create
+    /// clone` do.
+    fn noalias_variants(&self) -> std::collections::HashSet<(ProcId, bool)> {
+        let mut safe = std::collections::HashSet::new();
+        // SCRUST_ALIASED_STORAGE=1 turns it off (to compare).
+        if std::env::var_os("SCRUST_ALIASED_STORAGE").is_some() {
+            return safe;
+        }
+        let p = self.program;
+        for &(id, warp) in &self.an.variants {
+            if self.proc_is_async(id, warp) {
+                continue;
+            }
+            let body = &p.targets[id.target].procs[id.index].body;
+            let mut ok = true;
+            walk_stmts(body, &mut |st| {
+                if let Stmt::Cmd(Cmd::CreateClone, ..) = st {
+                    ok = false;
+                }
+            });
+            walk_exprs(body, &mut |e| match e {
+                Expr::Rep(Rep::AttrOf, _) => ok = false,
+                Expr::VarOf(v) if v.target == id.target && id.target != 0 => ok = false,
+                _ => {}
+            });
+            if ok {
+                safe.insert((id, warp));
+            }
+        }
+        // A procedure is only as safe as everything it calls.
+        loop {
+            let mut changed = false;
+            for &(id, warp) in safe.clone().iter() {
+                let mut ok = true;
+                walk_stmts(&p.targets[id.target].procs[id.index].body, &mut |st| {
+                    if let Stmt::Call { proc, .. } = st {
+                        if !safe.contains(&(*proc, self.an.callee_warp(p, *proc, warp))) {
+                            ok = false;
+                        }
+                    }
+                });
+                if !ok {
+                    safe.remove(&(id, warp));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        safe
+    }
+
+    /// Parameters and arguments carrying the variable storage of a
+    /// `noalias` function of target `ti`.
+    fn na_params(ti: usize) -> String {
+        if ti == 0 {
+            "g_: &mut L0".to_string()
+        } else {
+            format!("g_: &mut L0, l_: &mut L{ti}")
+        }
+    }
+    fn na_args(ti: usize) -> &'static str {
+        if ti == 0 {
+            "g.m()"
+        } else {
+            "g.m(), l.m()"
+        }
+    }
+
+    /// Storage pointers from the `&mut` parameters of a `noalias` function.
+    fn prologue_na(&mut self, ti: usize) {
+        self.flow.clear();
+        self.line("let g = LocalsPtr::from_mut(g_);");
+        if ti != 0 {
+            self.line("let l = LocalsPtr::from_mut(l_);");
+        }
+    }
+
     /// Cache pointers to the variable storage this function can reach.
     fn prologue(&mut self, ti: usize, is_async: bool) {
         self.flow.clear();
@@ -786,7 +886,7 @@ impl<'a> Gen<'a> {
         let params: Vec<String> =
             (0..pr.params.len()).map(|i| format!("a{}: {}", i, repr_ty(self.an.repr(Node::Param(id, i))))).collect();
         self.line(&format!("/// {}{}", pr.proccode.replace('\n', " "), if warp { " (warp)" } else { "" }));
-        let mut fc = FnCx { cx: Cx { owner: Owner::Proc(id), ti: id.target }, warp, is_async, depth: 0, w_open: false, is_proc: true, in_part: false };
+        let mut fc = FnCx { cx: Cx { owner: Owner::Proc(id), ti: id.target }, warp, is_async, depth: 0, w_open: false, noalias: false, is_proc: true, in_part: false };
         if is_async {
             let sep = if params.is_empty() { "" } else { ", " };
             self.line(&format!("pub fn {name}(me: TargetRef{sep}{}) -> Pin<Box<dyn Future<Output = bool>>> {{", params.join(", ")));
@@ -797,6 +897,28 @@ impl<'a> Gen<'a> {
             self.line("false");
             self.indent -= 2;
             self.line("    })");
+            self.line("}");
+        } else if self.noalias.contains(&(id, warp)) {
+            let sep = if params.is_empty() { "" } else { ", " };
+            let ti = id.target;
+            let args: String = (0..params.len()).map(|i| format!(", a{i}")).collect();
+            self.line(&format!("pub fn {name}(w: &mut World, me: TargetRef{sep}{}) -> bool {{", params.join(", ")));
+            self.indent += 1;
+            self.prologue(ti, false);
+            self.line(&format!("{name}_na(w, me, {}{args})", Self::na_args(ti)));
+            self.indent -= 1;
+            self.line("}");
+            self.line("");
+            if std::env::var_os("SCRUST_PROFILE_NOINLINE").is_some() {
+                self.line("#[inline(never)]");
+            }
+            self.line(&format!("pub fn {name}_na(w: &mut World, me: TargetRef, {}{sep}{}) -> bool {{", Self::na_params(ti), params.join(", ")));
+            self.indent += 1;
+            fc.noalias = true;
+            self.prologue_na(ti);
+            self.emit_body(&pr.body, &mut fc, &name, &params);
+            self.line("false");
+            self.indent -= 1;
             self.line("}");
         } else {
             let sep = if params.is_empty() { "" } else { ", " };
@@ -1417,7 +1539,12 @@ impl<'a> Gen<'a> {
             for &i in order {
                 self.line(&format!("let p{k}_{i} = {};", codes[i]));
             }
-            self.line(&format!("let _ = {name}(w, me{names});"));
+            if fc.noalias && self.noalias.contains(&(proc, callee_warp)) {
+                // Pass the storage on: the callee must not re-derive it.
+                self.line(&format!("let _ = {name}_na(w, me, {}{names});", Self::na_args(proc.target)));
+            } else {
+                self.line(&format!("let _ = {name}(w, me{names});"));
+            }
             return;
         }
         // Asynchronous callee: arguments first, then the call outside of any world borrow.
