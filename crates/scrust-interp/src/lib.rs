@@ -13,6 +13,13 @@
 //! `scrust trace --interp` compares it with compiled programs.
 
 mod exec;
+/// The browser module allocates like compiled programs (see
+/// `scrust_runtime::alloc`); wasm32's default allocator is slow at the many
+/// small strings and boxed futures of a running project.
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOC: scrust_runtime::alloc::FastAlloc = scrust_runtime::alloc::FastAlloc;
+
 #[cfg(target_arch = "wasm32")]
 mod web;
 
