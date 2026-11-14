@@ -53,17 +53,24 @@ if (argv[0] === '--wasm-child') {
     return;
 }
 
+// A string that is exactly the canonical form of its number behaves like the
+// number; unboxed storage may hold either (as in twref/run.js).
+const canonical = v => v !== '' && v !== 'NaN' && String(Number(v)) === v;
+const normalise = line => line.replace(/\{"t":"str","v":"([^"\\]*)"\}/g, (m, v) => (canonical(v) ? `{"t":"num","v":"${v}"}` : m));
+
 // Per-frame hashes of a trace, streamed (traces of big lists are huge).
 const hashes = (cmd, args) => new Promise(resolve => {
     const p = spawn(cmd, args, {stdio: ['ignore', 'pipe', 'pipe']});
     const out = [];
     let buf = '';
     let err = '';
+    // Decode across chunk boundaries (multi-byte characters may be split).
+    p.stdout.setEncoding('utf8');
     p.stdout.on('data', d => {
         buf += d;
         let i;
         while ((i = buf.indexOf('\n')) >= 0) {
-            out.push(crypto.createHash('sha1').update(buf.slice(0, i)).digest('hex').slice(0, 16));
+            out.push(crypto.createHash('sha1').update(normalise(buf.slice(0, i))).digest('hex').slice(0, 16));
             buf = buf.slice(i + 1);
         }
     });

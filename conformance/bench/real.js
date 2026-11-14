@@ -1,7 +1,7 @@
 // Real-project benchmark: TurboWarp's compiler vs scrust (native and wasm).
 //
 //   node conformance/bench/real.js <dir|file.sb3>... [--frames N] [--budget MS]
-//        [--engines tw,native,wasm] [--only substr] [--list a,b] [--rebuild] [--no-build] [--timeout S] [--build-only]
+//        [--engines tw,native,wasm] [--only substr] [--list a,b] [--rebuild] [--no-build] [--timeout S] [--build-only] [--repeat N]
 //
 // Every engine runs headless (no renderer, no audio) and deterministically:
 // virtual clock, seeded random numbers, one scheduler pass per frame, so all
@@ -129,7 +129,7 @@ if (process.argv[2] === '--child') {
 
 // ------------------------------------------------------------ driver
 const argv = process.argv.slice(2);
-const opt = {frames: 150, budget: 30000, warmup: 10, engines: ['tw', 'native', 'wasm'], only: null, list: null, rebuild: false, build: true, inputs: [], timeout: 180};
+const opt = {frames: 150, budget: 30000, warmup: 10, engines: ['tw', 'native', 'wasm'], only: null, list: null, rebuild: false, build: true, inputs: [], timeout: 180, repeat: 1};
 for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--frames') opt.frames = Number(argv[++i]);
@@ -142,6 +142,7 @@ for (let i = 0; i < argv.length; i++) {
     else if (a === '--no-build') opt.build = false;
     else if (a === '--timeout') opt.timeout = Number(argv[++i]);
     else if (a === '--build-only') opt.buildOnly = true;
+    else if (a === '--repeat') opt.repeat = Number(argv[++i]);
     else opt.inputs.push(a);
 }
 const baseOf = f => path.basename(f).replace(/\.sb3$/, '').replace(/[^\w.-]+/g, '_');
@@ -156,6 +157,15 @@ function projects () {
     return files;
 }
 
+// The fastest of `--repeat` runs (other processes only ever add time).
+async function best (cmd, args) {
+    let r = null;
+    for (let k = 0; k < opt.repeat; k++) {
+        const x = await runJson(cmd, args);
+        if (!r || (x.step && (!r.step || sum(x.step) < sum(r.step)))) r = x;
+    }
+    return r;
+}
 const runJson = (cmd, args) => new Promise(resolve => {
     const p = spawn(cmd, args, {stdio: ['ignore', 'pipe', 'pipe']});
     let out = ''; let err = '';
@@ -208,16 +218,16 @@ async function main () {
                 let old = null;
                 try { old = JSON.parse(fs.readFileSync(prev, 'utf8')).tw; } catch (_) { /* none */ }
                 if (old && old.step && (old.step.length >= opt.frames || sum(old.step) > opt.budget) && !process.env.BENCH_TW_AGAIN) res.tw = old;
-                else res.tw = await runJson(process.execPath, [__filename, '--child', 'tw', file, String(opt.frames), String(opt.budget)]);
+                else res.tw = await best(process.execPath, [__filename, '--child', 'tw', file, String(opt.frames), String(opt.budget)]);
             } else if (opt.buildOnly) {
                 res[e] = build(file, e);
                 continue;
             } else if (e === 'native') {
                 const b = build(file, 'native');
-                res.native = b.error ? b : await runJson(b.exe, ['--deterministic', '--frames', String(opt.frames), '--bench-json', '--bench-budget', String(opt.budget)]);
+                res.native = b.error ? b : await best(b.exe, ['--deterministic', '--frames', String(opt.frames), '--bench-json', '--bench-budget', String(opt.budget)]);
             } else if (e === 'wasm') {
                 const b = build(file, 'wasm');
-                res.wasm = b.error ? b : await runJson(process.execPath, [__filename, '--child', 'wasm', b.exe, String(opt.frames), String(opt.budget)]);
+                res.wasm = b.error ? b : await best(process.execPath, [__filename, '--child', 'wasm', b.exe, String(opt.frames), String(opt.budget)]);
             }
         }
         if (opt.buildOnly) {
