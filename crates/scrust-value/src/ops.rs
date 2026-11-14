@@ -1,7 +1,7 @@
 //! Operator block semantics (`scratch3_operators.js`) on already-cast inputs.
 
 use crate::jsstr::JsStr;
-use crate::num::{js_to_fixed10_parse, js_round};
+use crate::num::js_round;
 use crate::value::{is_int, ToNum, ToStr, Value};
 
 /// `operator_mod` (floored modulo).
@@ -72,15 +72,22 @@ pub fn random(from: &Value, to: &Value, rand: &mut dyn FnMut() -> f64) -> f64 {
 
 const PI: f64 = core::f64::consts::PI;
 
+/// TurboWarp's compiled rounding of sin / cos / tan:
+/// `Math.round(x * 1e10) / 1e10` (vanilla uses `parseFloat(x.toFixed(10))`).
+#[inline]
+fn round10(x: f64) -> f64 {
+    crate::num::js_round(x * 1e10) / 1e10
+}
 #[inline]
 pub fn sin_deg(n: f64) -> f64 {
-    js_to_fixed10_parse(libm::sin((PI * n) / 180.0))
+    round10(crate::jsmath::sin((PI * n) / 180.0))
 }
 #[inline]
 pub fn cos_deg(n: f64) -> f64 {
-    js_to_fixed10_parse(libm::cos((PI * n) / 180.0))
+    round10(crate::jsmath::cos((PI * n) / 180.0))
 }
-/// `MathUtil.tan` (vanilla: the reduced angle is what gets passed to `Math.tan`).
+/// TurboWarp's `tan` (jsexecute.js): the angle reduced by `% 360`, exact
+/// infinities at the poles.
 pub fn tan_deg(n: f64) -> f64 {
     let a = n % 360.0;
     if a == -270.0 || a == 90.0 {
@@ -89,37 +96,32 @@ pub fn tan_deg(n: f64) -> f64 {
     if a == -90.0 || a == 270.0 {
         return f64::NEG_INFINITY;
     }
-    js_to_fixed10_parse(libm::tan((PI * a) / 180.0))
+    round10(crate::jsmath::tan((PI * a) / 180.0))
 }
 #[inline]
 pub fn asin_deg(n: f64) -> f64 {
-    (libm::asin(n) * 180.0) / PI
+    (crate::jsmath::asin(n) * 180.0) / PI
 }
 #[inline]
 pub fn acos_deg(n: f64) -> f64 {
-    (libm::acos(n) * 180.0) / PI
+    (crate::jsmath::acos(n) * 180.0) / PI
 }
 #[inline]
 pub fn atan_deg(n: f64) -> f64 {
-    (libm::atan(n) * 180.0) / PI
+    (crate::jsmath::atan(n) * 180.0) / PI
 }
 #[inline]
 pub fn ln(n: f64) -> f64 {
-    libm::log(n)
+    crate::jsmath::log(n)
 }
 /// `Math.log(n) / Math.LN10` — deliberately not `log10`.
 #[inline]
 pub fn log10(n: f64) -> f64 {
-    libm::log(n) / core::f64::consts::LN_10
+    crate::jsmath::log(n) / core::f64::consts::LN_10
 }
 #[inline]
 pub fn exp(n: f64) -> f64 {
-    // `e ^ 1` is common enough to pin: every V8 version returns Math.E here,
-    // while the fdlibm port in `libm` is 1 ULP off (docs/decisions/math-libm.md).
-    if n == 1.0 {
-        return core::f64::consts::E;
-    }
-    libm::exp(n)
+    crate::jsmath::exp(n)
 }
 /// `Math.pow(10, n)`. Integer exponents whose result (or reciprocal) is
 /// exactly representable are computed exactly, which is what every
@@ -138,16 +140,7 @@ pub fn pow10(n: f64) -> f64 {
 
 /// `Math.pow` with the ECMAScript special cases that differ from C `pow`.
 pub fn js_pow(base: f64, e: f64) -> f64 {
-    if e.is_nan() {
-        return f64::NAN;
-    }
-    if e == 0.0 {
-        return 1.0;
-    }
-    if (base == 1.0 || base == -1.0) && e.is_infinite() {
-        return f64::NAN;
-    }
-    libm::pow(base, e)
+    crate::jsmath::pow(base, e)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -218,9 +211,10 @@ pub fn mathop(op: &JsStr, n: f64) -> f64 {
     MathOp::from_name(op).apply(n)
 }
 
-/// `data_listcontents`: no separator iff every item is a *string* of length 1.
+/// TurboWarp's `listContents`: no separator iff every item's string form
+/// has length 1 (vanilla requires items that are strings).
 pub fn list_contents<'a>(items: impl Iterator<Item = &'a Value> + Clone) -> JsStr {
-    let all_single = items.clone().all(|v| matches!(v, Value::Str(s) if s.len() == 1));
+    let all_single = items.clone().all(|v| v.to_str().len() == 1);
     let mut units: Vec<u16> = Vec::new();
     for (i, v) in items.enumerate() {
         if i > 0 && !all_single {

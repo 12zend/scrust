@@ -58,10 +58,9 @@ impl World {
             return;
         }
         let (ox, oy) = (tg.x, tg.y);
-        let (nx, ny) = match self.with_renderer(|r, w| r.fenced_position(w, t, x, y)) {
-            Some(p) => p,
-            None => (x, y),
-        };
+        // TurboWarp skips the fence when `runtimeOptions.fencing` is off.
+        let fenced = if self.options.fencing { self.with_renderer(|r, w| r.fenced_position(w, t, x, y)) } else { None };
+        let (nx, ny) = fenced.unwrap_or((x, y));
         let tg = self.target_mut(t);
         tg.x = nx;
         tg.y = ny;
@@ -72,8 +71,8 @@ impl World {
     pub fn move_steps(&mut self, me: TargetRef, steps: f64) {
         let tg = self.target(me);
         let radians = deg_to_rad(90.0 - tg.direction);
-        let dx = steps * libm::cos(radians);
-        let dy = steps * libm::sin(radians);
+        let dx = steps * scrust_value::jsmath::cos(radians);
+        let dy = steps * scrust_value::jsmath::sin(radians);
         let (x, y) = (tg.x + dx, tg.y + dy);
         self.set_xy(me, x, y);
     }
@@ -86,11 +85,11 @@ impl World {
     pub fn target_xy(&mut self, to: &Value) -> Option<(f64, f64)> {
         if let Value::Str(s) = to {
             if s.eq_str("_mouse_") {
-                return Some((self.io.mouse_x, self.io.mouse_y));
+                return Some((self.mouse_coord(self.io.mouse_x), self.mouse_coord(self.io.mouse_y)));
             }
             if s.eq_str("_random_") {
-                let x = js_round(STAGE_WIDTH * (self.random() - 0.5));
-                let y = js_round(STAGE_HEIGHT * (self.random() - 0.5));
+                let x = js_round(stage_width() * (self.random() - 0.5));
+                let y = js_round(stage_height() * (self.random() - 0.5));
                 return Some((x, y));
             }
         }
@@ -132,8 +131,8 @@ impl World {
         let (tx, ty);
         match &towards {
             Value::Str(s) if s.eq_str("_mouse_") => {
-                tx = self.io.mouse_x;
-                ty = self.io.mouse_y;
+                tx = self.mouse_coord(self.io.mouse_x);
+                ty = self.mouse_coord(self.io.mouse_y);
             }
             Value::Str(s) if s.eq_str("_random_") => {
                 let d = js_round(self.random() * 360.0) - 180.0;
@@ -150,7 +149,7 @@ impl World {
         let tg = self.target(me);
         let dx = tx - tg.x;
         let dy = ty - tg.y;
-        let direction = 90.0 - rad_to_deg(libm::atan2(dy, dx));
+        let direction = 90.0 - rad_to_deg(scrust_value::jsmath::atan2(dy, dx));
         self.set_direction(me, direction);
     }
 
@@ -201,10 +200,10 @@ impl World {
 
     pub fn if_on_edge_bounce(&mut self, me: TargetRef) {
         let Some(Some(bounds)) = self.with_renderer(|r, w| r.bounds(w, me)) else { return };
-        let dist_left = (STAGE_WIDTH / 2.0 + bounds.left).max(0.0);
-        let dist_top = (STAGE_HEIGHT / 2.0 - bounds.top).max(0.0);
-        let dist_right = (STAGE_WIDTH / 2.0 - bounds.right).max(0.0);
-        let dist_bottom = (STAGE_HEIGHT / 2.0 + bounds.bottom).max(0.0);
+        let dist_left = (stage_width() / 2.0 + bounds.left).max(0.0);
+        let dist_top = (stage_height() / 2.0 - bounds.top).max(0.0);
+        let dist_right = (stage_width() / 2.0 - bounds.right).max(0.0);
+        let dist_bottom = (stage_height() / 2.0 + bounds.bottom).max(0.0);
         let mut nearest = 0;
         let mut min_dist = f64::INFINITY;
         for (i, d) in [dist_left, dist_top, dist_right, dist_bottom].into_iter().enumerate() {
@@ -217,15 +216,15 @@ impl World {
             return;
         }
         let radians = deg_to_rad(90.0 - self.target(me).direction);
-        let mut dx = libm::cos(radians);
-        let mut dy = -libm::sin(radians);
+        let mut dx = scrust_value::jsmath::cos(radians);
+        let mut dy = -scrust_value::jsmath::sin(radians);
         match nearest {
             0 => dx = dx.abs().max(0.2),
             1 => dy = dy.abs().max(0.2),
             2 => dx = 0.0 - dx.abs().max(0.2),
             _ => dy = 0.0 - dy.abs().max(0.2),
         }
-        let new_direction = rad_to_deg(libm::atan2(dy, dx)) + 90.0;
+        let new_direction = rad_to_deg(scrust_value::jsmath::atan2(dy, dx)) + 90.0;
         self.set_direction(me, new_direction);
         // keepInFence with the default (stage) fence.
         let tg = self.target(me);
@@ -233,17 +232,17 @@ impl World {
         if let Some(Some(b)) = self.with_renderer(|r, w| r.bounds(w, me)) {
             let mut dx = 0.0;
             let mut dy = 0.0;
-            if b.left < -STAGE_WIDTH / 2.0 {
-                dx += -STAGE_WIDTH / 2.0 - b.left;
+            if b.left < -stage_width() / 2.0 {
+                dx += -stage_width() / 2.0 - b.left;
             }
-            if b.right > STAGE_WIDTH / 2.0 {
-                dx += STAGE_WIDTH / 2.0 - b.right;
+            if b.right > stage_width() / 2.0 {
+                dx += stage_width() / 2.0 - b.right;
             }
-            if b.top > STAGE_HEIGHT / 2.0 {
-                dy += STAGE_HEIGHT / 2.0 - b.top;
+            if b.top > stage_height() / 2.0 {
+                dy += stage_height() / 2.0 - b.top;
             }
-            if b.bottom < -STAGE_HEIGHT / 2.0 {
-                dy += -STAGE_HEIGHT / 2.0 - b.bottom;
+            if b.bottom < -stage_height() / 2.0 {
+                dy += -stage_height() / 2.0 - b.bottom;
             }
             self.set_xy(me, x + dx, y + dy);
         }
@@ -478,8 +477,9 @@ impl World {
         }
         let (sprite, costume) = (tg.sprite, tg.costume);
         let Some((ow, oh)) = self.with_renderer(|r, _| r.costume_size(sprite, costume)) else { return };
-        let min_scale = f64::min(1.0, f64::max(5.0 / ow, 5.0 / oh));
-        let max_scale = f64::min((1.5 * STAGE_WIDTH) / ow, (1.5 * STAGE_HEIGHT) / oh);
+        let fencing = self.options.fencing;
+        let min_scale = if fencing { f64::min(1.0, f64::max(5.0 / ow, 5.0 / oh)) } else { 0.0 };
+        let max_scale = if fencing { f64::min((1.5 * stage_width()) / ow, (1.5 * stage_height()) / oh) } else { f64::INFINITY };
         self.target_mut(me).size = clamp(size / 100.0, min_scale, max_scale) * 100.0;
         self.visual_change(me);
     }
@@ -597,6 +597,28 @@ impl World {
         (self.current_msecs, duration)
     }
 
+    /// Music `play note / drum for beats`, `rest for beats`: beats clamped to
+    /// 0..100; a note for 0 beats does nothing. Returns the stack timer.
+    pub fn music_begin(&mut self, kind: u8, beats: f64) -> Option<(f64, f64)> {
+        let beats = clamp(beats, 0.0, 100.0);
+        if kind == 0 && beats == 0.0 {
+            return None;
+        }
+        let secs = (60.0 / self.tempo) * beats;
+        Some((self.current_msecs, secs * 1000.0))
+    }
+
+    /// `_updateTempo`: clamped to 20..500.
+    pub fn music_set_tempo(&mut self, _me: TargetRef, tempo: f64) {
+        self.tempo = clamp(tempo, 20.0, 500.0);
+    }
+    pub fn music_change_tempo(&mut self, _me: TargetRef, change: f64) {
+        self.tempo = clamp(self.tempo + change, 20.0, 500.0);
+    }
+    pub fn music_tempo(&mut self, _me: TargetRef) -> f64 {
+        self.tempo
+    }
+
     /// `stackTimerFinished`.
     #[inline]
     pub fn wait_done(&self, timer: (f64, f64)) -> bool {
@@ -648,13 +670,35 @@ impl World {
         self.username.clone()
     }
 
+    /// `translate_getViewerLanguage`: the name of the viewer's language;
+    /// scrust always reports English (the reference's `en` locale).
+    pub fn viewer_language(&mut self, _me: TargetRef) -> JsStr {
+        JsStr::from("English")
+    }
+
+    /// `translate_getTranslate` needs the translation server; without it the
+    /// text is returned unchanged.
+    pub fn translate(&mut self, _me: TargetRef, words: JsStr, _language: JsStr) -> JsStr {
+        words
+    }
+
     #[inline]
     pub fn mouse_x(&mut self, _me: TargetRef) -> f64 {
-        self.io.mouse_x
+        self.mouse_coord(self.io.mouse_x)
     }
     #[inline]
     pub fn mouse_y(&mut self, _me: TargetRef) -> f64 {
-        self.io.mouse_y
+        self.mouse_coord(self.io.mouse_y)
+    }
+    /// `Mouse.getScratchX/Y`: whole numbers with `miscLimits`, otherwise
+    /// three decimals.
+    #[inline]
+    fn mouse_coord(&self, v: f64) -> f64 {
+        if self.options.misc_limits {
+            js_round(v)
+        } else {
+            js_round(v * 1000.0) / 1000.0
+        }
     }
     #[inline]
     pub fn mouse_down(&mut self, _me: TargetRef) -> bool {
@@ -766,7 +810,7 @@ impl World {
             return 10000.0;
         }
         let (tx, ty) = match &to {
-            Value::Str(s) if s.eq_str("_mouse_") => (self.io.mouse_x, self.io.mouse_y),
+            Value::Str(s) if s.eq_str("_mouse_") => (self.mouse_coord(self.io.mouse_x), self.mouse_coord(self.io.mouse_y)),
             other => {
                 let Some(t) = self.sprite_by_name(&other.to_str()) else { return 10000.0 };
                 (self.target(t).x, self.target(t).y)
@@ -784,12 +828,12 @@ impl World {
         }
         match &object {
             Value::Str(s) if s.eq_str("_mouse_") => {
-                let (x, y) = (self.io.mouse_x, self.io.mouse_y);
+                let (x, y) = (self.mouse_coord(self.io.mouse_x), self.mouse_coord(self.io.mouse_y));
                 self.with_renderer(|r, w| r.touching_point(w, me, x, y)).unwrap_or(false)
             }
             Value::Str(s) if s.eq_str("_edge_") => match self.with_renderer(|r, w| r.bounds(w, me)).flatten() {
                 Some(b) => {
-                    b.left < -STAGE_WIDTH / 2.0 || b.right > STAGE_WIDTH / 2.0 || b.top > STAGE_HEIGHT / 2.0 || b.bottom < -STAGE_HEIGHT / 2.0
+                    b.left < -stage_width() / 2.0 || b.right > stage_width() / 2.0 || b.top > stage_height() / 2.0 || b.bottom < -stage_height() / 2.0
                 }
                 None => false,
             },
@@ -955,26 +999,32 @@ impl World {
         }
     }
 
-    pub fn sound_set_effect(&mut self, me: TargetRef, effect: &str, value: f64) {
-        self.update_sound_effect(me, effect, value, false);
+    /// `setEffect` / `changeEffect`: `Promise.resolve()` (a one-tick wait)
+    /// unless the effect name is unknown.
+    pub fn sound_set_effect(&mut self, me: TargetRef, effect: &str, value: f64) -> Option<Wake> {
+        self.update_sound_effect(me, effect, value, false)
     }
-    pub fn sound_change_effect(&mut self, me: TargetRef, effect: &str, value: f64) {
-        self.update_sound_effect(me, effect, value, true);
+    pub fn sound_change_effect(&mut self, me: TargetRef, effect: &str, value: f64) -> Option<Wake> {
+        self.update_sound_effect(me, effect, value, true)
     }
-    fn update_sound_effect(&mut self, me: TargetRef, effect: &str, value: f64, change: bool) {
+    fn update_sound_effect(&mut self, me: TargetRef, effect: &str, value: f64, change: bool) -> Option<Wake> {
+        let misc_limits = self.options.misc_limits;
         let tg = self.target_mut(me);
         match effect.to_lowercase().as_str() {
             "pitch" => {
                 let v = if change { tg.pitch + value } else { value };
-                tg.pitch = clamp(v, -360.0, 360.0);
+                // LARGER_EFFECT_RANGE without miscLimits.
+                let r = if misc_limits { 360.0 } else { 1000.0 };
+                tg.pitch = clamp(v, -r, r);
             }
             "pan" => {
                 let v = if change { tg.pan + value } else { value };
                 tg.pan = clamp(v, -100.0, 100.0);
             }
-            _ => return,
+            _ => return None,
         }
         self.sync_audio(me);
+        self.promise_unless_no_limits()
     }
     pub fn sound_clear_effects(&mut self, me: TargetRef) {
         let tg = self.target_mut(me);
@@ -982,13 +1032,24 @@ impl World {
         tg.pan = 0.0;
         self.sync_audio(me);
     }
-    pub fn sound_set_volume(&mut self, me: TargetRef, volume: f64) {
+    /// `setVolume` / `changeVolume`: a one-tick wait with `miscLimits`.
+    pub fn sound_set_volume(&mut self, me: TargetRef, volume: f64) -> Option<Wake> {
         self.target_mut(me).volume = clamp(volume, 0.0, 100.0);
         self.sync_audio(me);
+        self.promise_unless_no_limits()
     }
-    pub fn sound_change_volume(&mut self, me: TargetRef, volume: f64) {
+    /// `Promise.resolve()` with `miscLimits`, otherwise a redraw request.
+    fn promise_unless_no_limits(&mut self) -> Option<Wake> {
+        if self.options.misc_limits {
+            Some(Wake::Time(f64::NEG_INFINITY))
+        } else {
+            self.request_redraw();
+            None
+        }
+    }
+    pub fn sound_change_volume(&mut self, me: TargetRef, volume: f64) -> Option<Wake> {
         let v = volume + self.target(me).volume;
-        self.sound_set_volume(me, v);
+        self.sound_set_volume(me, v)
     }
     #[inline]
     pub fn volume(&mut self, me: TargetRef) -> f64 {
@@ -1061,8 +1122,9 @@ impl World {
 
     /// Mouse move in Scratch coordinates.
     pub fn post_mouse_move(&mut self, x: f64, y: f64) {
-        self.io.mouse_x = js_round(clamp(x, -240.0, 240.0));
-        self.io.mouse_y = js_round(clamp(y, -180.0, 180.0));
+        // Stored unrounded; `getScratchX/Y` round on read (see `mouse_coord`).
+        self.io.mouse_x = clamp(x, -stage_width() / 2.0, stage_width() / 2.0);
+        self.io.mouse_y = clamp(y, -stage_height() / 2.0, stage_height() / 2.0);
         // Dragging a draggable sprite (what scratch-gui does through
         // `startDrag` / `postSpriteInfo({force: true})`).
         if let Some((t, dx, dy, _)) = self.io.drag {
@@ -1084,7 +1146,7 @@ impl World {
         if prev == down {
             return;
         }
-        if !(x > -240.0 && x < 240.0 && y > -180.0 && y < 180.0) {
+        if !(x > -stage_width() / 2.0 && x < stage_width() / 2.0 && y > -stage_height() / 2.0 && y < stage_height() / 2.0) {
             return;
         }
         // Finish a drag: a sprite that was actually moved does not get a click.

@@ -99,8 +99,17 @@ impl World {
                 }
                 _ => o.push_str("null"),
             }
+            // Declared variables, then those created on demand, in creation order.
+            let sd = &self.program.sprites[tg.sprite];
+            let created = &self.created[tg.sprite];
+            let all_vars = tg.locals.vars();
+            let vars: Vec<&(&str, Value)> = all_vars
+                .iter()
+                .take(sd.declared_vars)
+                .chain(created.iter().filter(|c| !c.0).filter_map(|c| all_vars.get(c.1 as usize)))
+                .collect();
             o.push_str(",\"vars\":[");
-            for (j, (name, v)) in tg.locals.vars().iter().enumerate() {
+            for (j, (name, v)) in vars.iter().map(|p| (&p.0, &p.1)).enumerate() {
                 if j > 0 {
                     o.push(',');
                 }
@@ -110,8 +119,14 @@ impl World {
                 json_value(v, &mut o);
                 o.push(']');
             }
+            let all_lists = tg.locals.lists();
+            let lists: Vec<&(&str, Vec<Value>)> = all_lists
+                .iter()
+                .take(sd.declared_lists)
+                .chain(created.iter().filter(|c| c.0).filter_map(|c| all_lists.get(c.1 as usize)))
+                .collect();
             o.push_str("],\"lists\":[");
-            for (j, (name, items)) in tg.locals.lists().iter().enumerate() {
+            for (j, (name, items)) in lists.iter().map(|p| (&p.0, &p.1)).enumerate() {
                 if j > 0 {
                     o.push(',');
                 }

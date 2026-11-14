@@ -159,12 +159,19 @@ impl World {
     }
 
     pub fn pen_change_size(&mut self, me: TargetRef, size: f64) {
-        let pen = &mut self.target_mut(me).pen;
-        pen.diameter = (pen.diameter + size).max(1.0).min(1200.0);
+        let d = self.target(me).pen.diameter + size;
+        self.set_pen_diameter(me, d);
+    }
+
+    /// `_clampPenSize`: 1..1200, or only non-negative with high quality pen
+    /// or without `miscLimits`.
+    fn set_pen_diameter(&mut self, me: TargetRef, size: f64) {
+        let unlimited = self.options.hq || !self.options.misc_limits;
+        self.target_mut(me).pen.diameter = if unlimited { f64::max(0.0, size) } else { size.max(1.0).min(1200.0) };
     }
 
     pub fn pen_set_size(&mut self, me: TargetRef, size: f64) {
-        self.target_mut(me).pen.diameter = size.max(1.0).min(1200.0);
+        self.set_pen_diameter(me, size);
     }
 
     pub fn pen_set_hue(&mut self, me: TargetRef, hue: f64) {

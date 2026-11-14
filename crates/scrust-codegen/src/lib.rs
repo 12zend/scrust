@@ -22,6 +22,14 @@ pub struct GenOptions {
     /// Default frames per second baked into the program.
     pub fps: f64,
     pub turbo: bool,
+    /// TurboWarp runtime options from the project's config comment.
+    pub fencing: bool,
+    pub misc_limits: bool,
+    pub max_clones: f64,
+    pub hq: bool,
+    /// Stage size (TurboWarp config).
+    pub stage_width: f64,
+    pub stage_height: f64,
     /// Build a `cdylib` for the browser host instead of a native binary.
     pub wasm: bool,
     /// Load assets from an `assets/` directory at run time instead of embedding them.
@@ -178,10 +186,16 @@ impl<'a> Gen<'a> {
         let o = self.opts;
         let _ = writeln!(
             s,
-            "pub fn default_options() -> Options {{\n    Options {{ fps: {}, turbo: {}, warp_timer: {}, ..Options::default() }}\n}}\n",
+            "pub fn default_options() -> Options {{\n    Options {{ fps: {}, turbo: {}, warp_timer: {}, fencing: {}, misc_limits: {}, max_clones: {}, hq: {}, stage_width: {}, stage_height: {}, ..Options::default() }}\n}}\n",
             f64_lit(o.fps),
             o.turbo,
-            o.warp_timer
+            o.warp_timer,
+            o.fencing,
+            o.misc_limits,
+            f64_lit(o.max_clones),
+            o.hq,
+            f64_lit(o.stage_width),
+            f64_lit(o.stage_height)
         );
         let mut statics = String::new();
         s.push_str("pub fn program() -> ProgramDef {\n    ProgramDef {\n        sprites: vec![\n");
@@ -252,14 +266,16 @@ impl<'a> Gen<'a> {
                     Hat::TouchingObject(_) => ("Touching", String::new(), 0),
                 };
                 let pred = if sc.hat.is_edge_activated() { format!("Some(t{ti}_s{si}_pred)") } else { "None".to_string() };
+                let creates: Vec<String> = self.created_on_compile(ti, &sc.body).iter().map(|(l, i)| format!("({l}, {i})")).collect();
                 let _ = writeln!(
                     s,
-                    "                    ScriptDef {{ kind: HatKind::{}, field: {}, msg: {}, restart: {}, start: t{ti}_s{si}, pred: {} }},",
+                    "                    ScriptDef {{ kind: HatKind::{}, field: {}, msg: {}, restart: {}, start: t{ti}_s{si}, pred: {}, creates: &[{}] }},",
                     kind,
                     rust_str(&field),
                     msg,
                     sc.hat.restarts_existing(),
-                    pred
+                    pred,
+                    creates.join(", ")
                 );
             }
             let rs = match src.rotation_style.as_str() {
@@ -269,7 +285,7 @@ impl<'a> Gen<'a> {
             };
             let _ = writeln!(
                 s,
-                "                ],\n                new_locals: new_l{ti},\n                x: {}, y: {}, size: {}, direction: {}, visible: {}, draggable: {}, costume: {}, rotation_style: RotationStyle::{}, volume: {},\n            }},",
+                "                ],\n                new_locals: new_l{ti},\n                x: {}, y: {}, size: {}, direction: {}, visible: {}, draggable: {}, costume: {}, rotation_style: RotationStyle::{}, volume: {},\n                declared_vars: {}, declared_lists: {}, tempo: {},\n            }},",
                 f64_lit(src.x),
                 f64_lit(src.y),
                 f64_lit(src.size),
@@ -278,7 +294,10 @@ impl<'a> Gen<'a> {
                 src.draggable,
                 src.current_costume,
                 rs,
-                f64_lit(src.volume)
+                f64_lit(src.volume),
+                src.variables.len().min(t.vars.len()),
+                src.lists.len().min(t.lists.len()),
+                f64_lit(src.tempo)
             );
         }
         s.push_str("        ],\n        messages: vec![");
@@ -310,6 +329,57 @@ impl<'a> Gen<'a> {
         } else {
             let _ = writeln!(s, "                {field}: vec![\n{rows}                ],");
         }
+    }
+
+    /// Variables and lists of target `ti` that the project does not declare
+    /// but `body` (or a procedure it calls, transitively) refers to: TurboWarp
+    /// creates them when it compiles the script (`_descendVariable`), in the
+    /// order it meets them.
+    fn created_on_compile(&self, ti: usize, body: &[Stmt]) -> Vec<(bool, u16)> {
+        let src = &self.project.targets[ti];
+        let (nv, nl) = (src.variables.len(), src.lists.len());
+        let mut out: Vec<(bool, u16)> = Vec::new();
+        let mut seen_procs: Vec<usize> = Vec::new();
+        let mut stack: Vec<&[Stmt]> = vec![body];
+        while let Some(b) = stack.pop() {
+            let mut add = |is_list: bool, target: usize, index: usize| {
+                let declared = if is_list { nl } else { nv };
+                if target == ti && index >= declared && !out.contains(&(is_list, index as u16)) {
+                    out.push((is_list, index as u16));
+                }
+            };
+            let mut calls: Vec<usize> = Vec::new();
+            walk_stmts(b, &mut |st| {
+                match st {
+                    Stmt::SetVar(v, _) | Stmt::ChangeVar(v, _) | Stmt::ShowVar(v, _) | Stmt::ForEach(v, _, _) => add(false, v.target, v.index),
+                    Stmt::ListAdd(l, _) | Stmt::ListDelete(l, _) | Stmt::ListDeleteAll(l) | Stmt::ListInsert(l, _, _) | Stmt::ListReplace(l, _, _) | Stmt::ShowList(l, _) => {
+                        add(true, l.target, l.index)
+                    }
+                    Stmt::Call { proc, .. } if proc.target == ti => calls.push(proc.index),
+                    _ => {}
+                }
+                fn rec(e: &Expr, add: &mut dyn FnMut(bool, usize, usize)) {
+                    match e {
+                        Expr::Var(v) => add(false, v.target, v.index),
+                        Expr::ListContents(l) | Expr::ListLen(l) | Expr::ListItem(l, _) | Expr::ListIndexOf(l, _) | Expr::ListContains(l, _) => add(true, l.target, l.index),
+                        _ => {}
+                    }
+                    for c in e.children() {
+                        rec(c, add);
+                    }
+                }
+                for e in st.exprs() {
+                    rec(e, &mut add);
+                }
+            });
+            for pi in calls.into_iter().rev() {
+                if !seen_procs.contains(&pi) {
+                    seen_procs.push(pi);
+                    stack.push(&self.program.targets[ti].procs[pi].body);
+                }
+            }
+        }
+        out
     }
 
     fn monitor_def(&self, m: &scrust_sb3::Monitor) -> Option<String> {
@@ -758,6 +828,7 @@ impl<'a> Gen<'a> {
         let mut hit = false;
         walk_stmts(body, &mut |s| match s {
             Stmt::SayForSecs { .. } | Stmt::Ask(_) | Stmt::PlaySoundUntilDone(_) => hit = true,
+            Stmt::Cmd(c, ..) if c.is_promise() => hit = true,
             Stmt::Call { proc, .. } if self.an.promise_tail.contains(proc) => hit = true,
             _ => {}
         });
@@ -932,7 +1003,22 @@ impl<'a> Gen<'a> {
                     let _ = write!(lets, "let c{} = {}; ", i, codes[i]);
                 }
                 let names: String = (0..codes.len()).map(|i| format!(", c{}", i)).collect();
-                self.line(&format!("{{ {}w.{}(me{}); }}", lets, cmd.method(), names));
+                if cmd.is_promise() {
+                    let wk = self.bind(fc, "wk", &format!("{{ {}w.{}(me{}) }}", lets, cmd.method(), names));
+                    if fc.is_async {
+                        self.close_w(fc);
+                        self.line(&format!("if let Some({wk}) = {wk} {{"));
+                        self.indent += 1;
+                        self.line(&format!("wait_external({wk}).await;"));
+                        self.promise_done(fc, tail);
+                        self.indent -= 1;
+                        self.line("}");
+                    } else {
+                        self.line(&format!("let _ = {wk};"));
+                    }
+                } else {
+                    self.line(&format!("{{ {}w.{}(me{}); }}", lets, cmd.method(), names));
+                }
             }
             Stmt::Discard(args) => {
                 let refs: Vec<&Expr> = args.iter().collect();
@@ -1012,8 +1098,6 @@ impl<'a> Gen<'a> {
                 self.line(&format!("{n} -= 1.0;"));
                 self.line(&format!("if !({n} >= 0.0) {{ break; }}"));
                 self.loop_body(body, fc, asyncy);
-                // The block is re-executed (inputs included) on every iteration.
-                self.discard(&[times], fc);
                 self.end_loop(fc, asyncy);
             }
             Stmt::Forever(body) => {
@@ -1077,10 +1161,30 @@ impl<'a> Gen<'a> {
                 }
                 self.line("loop {");
                 self.indent += 1;
-                self.discard(&[secs], fc);
                 let done = self.bind(fc, "d", &format!("w.wait_done({tm})"));
                 self.line(&format!("if {done} {{ break; }}"));
                 self.yield_retry(fc);
+                self.indent -= 1;
+                self.line("}");
+            }
+            Stmt::MusicWait { kind, arg, beats } => {
+                // Compatibility-layer block: inputs once, then a stack timer
+                // re-checked on every re-execution (like `wait`).
+                let a = self.expr(arg, &fc.cx).val();
+                let b = self.expr(beats, &fc.cx).num();
+                let tm = self.bind(fc, "tm", &format!("{{ let _ = {a}; let b_ = {b}; w.music_begin({kind}, b_) }}"));
+                self.line(&format!("if let Some({tm}) = {tm} {{"));
+                self.indent += 1;
+                if !fc.warp {
+                    self.line("yield_now().await;");
+                }
+                self.line("loop {");
+                self.indent += 1;
+                let done = self.bind(fc, "d", &format!("w.wait_done({tm})"));
+                self.line(&format!("if {done} {{ break; }}"));
+                self.yield_retry(fc);
+                self.indent -= 1;
+                self.line("}");
                 self.indent -= 1;
                 self.line("}");
             }
@@ -1105,18 +1209,14 @@ impl<'a> Gen<'a> {
                     }
                 };
                 let th = self.bind(fc, "th", &start);
-                let again: Vec<&Expr> = match b {
-                    BroadcastRef::Dynamic(e) => vec![e],
-                    _ => vec![],
-                };
-                self.wait_threads(&th, &again, fc);
+                self.wait_threads(&th, &[], fc);
             }
             Stmt::SwitchBackdropAndWait(e) => {
                 let x = self.expr(e, &fc.cx);
                 let th = self.bind(fc, "th", &format!("{{ let v_ = {}; w.switch_backdrop_threads(v_) }}", x.val()));
                 // Bug-compatible with scratch-vm: starting hats here aborts the tick.
                 self.line(&format!("if !{th}.is_empty() {{ world().abort_tick(); yield_now().await; }}"));
-                self.wait_threads(&th, &[e], fc);
+                self.wait_threads(&th, &[], fc);
             }
             Stmt::Glide { secs, x, y } => {
                 let (cs, cx_, cy) = (self.expr(secs, &fc.cx).num(), self.expr(x, &fc.cx).num(), self.expr(y, &fc.cx).num());
@@ -1126,7 +1226,6 @@ impl<'a> Gen<'a> {
                 self.line("loop {");
                 self.indent += 1;
                 self.yield_retry(fc);
-                self.discard(&[secs, x, y], fc);
                 let d = self.bind(fc, "d", &format!("w.glide_step(me, &{g})"));
                 self.line(&format!("if {d} {{ break; }}"));
                 self.indent -= 1;
@@ -1149,7 +1248,6 @@ impl<'a> Gen<'a> {
                 self.line("loop {");
                 self.indent += 1;
                 self.yield_retry(fc);
-                self.discard(&[secs], fc);
                 let step = if dynamic_to {
                     format!("{{ let t_ = {ct}; match w.target_xy(&t_) {{ Some(_) => w.glide_step(me, &{g}), None => true }} }}")
                 } else {
@@ -1261,6 +1359,12 @@ impl<'a> Gen<'a> {
         let callee_async = self.proc_is_async(proc, callee_warp);
         let name = self.proc_name(proc, callee_warp);
         let k = self.fresh();
+        // TurboWarp yields before a procedure calls itself outside warp mode
+        // (`yieldForRecursion`, jsgen.js), ahead of evaluating the arguments.
+        if !fc.warp && fc.is_async && fc.cx.owner.proc() == Some(proc) {
+            self.close_w(fc);
+            self.line("yield_now().await;");
+        }
         let mut codes: Vec<String> = Vec::new();
         for (i, a) in args.iter().enumerate() {
             let x = self.expr(a, &fc.cx);
@@ -1273,16 +1377,7 @@ impl<'a> Gen<'a> {
             for &i in order {
                 self.line(&format!("let p{k}_{i} = {};", codes[i]));
             }
-            if impure.is_empty() {
-                self.line(&format!("{name}(w, me{names});"));
-            } else {
-                // A `stop this script` inside re-executes the call block's inputs.
-                self.line(&format!("if {name}(w, me{names}) {{"));
-                self.indent += 1;
-                self.discard(&impure, fc);
-                self.indent -= 1;
-                self.line("}");
-            }
+            self.line(&format!("let _ = {name}(w, me{names});"));
             return;
         }
         // Asynchronous callee: arguments first, then the call outside of any world borrow.
@@ -1301,26 +1396,8 @@ impl<'a> Gen<'a> {
             self.indent -= 1;
             self.line("}");
         }
-        // Non-warp calls into a recursive procedure yield when the call is
-        // recursive (scratch-vm `isRecursiveCall`).
-        let track = !callee_warp && self.an.cyclic.contains(&proc);
-        if track {
-            let uid = (proc.target as u32) << 16 | proc.index as u32;
-            self.line(&format!("if world().enter_call({}, {}) {{ yield_now().await; }}", uid, fc.depth.min(200)));
-        }
-        if impure.is_empty() {
-            self.line(&format!("{name}(me{names}).await;"));
-        } else {
-            self.line(&format!("if {name}(me{names}).await {{"));
-            self.indent += 1;
-            self.discard(&impure, fc);
-            self.close_w(fc);
-            self.indent -= 1;
-            self.line("}");
-        }
-        if track {
-            self.line("world().exit_call();");
-        }
+        let _ = &impure;
+        self.line(&format!("let _ = {name}(me{names}).await;"));
         if tail == Tail::No && self.an.promise_tail.contains(&proc) {
             self.line("world().set_skip_loop_yield(false);");
         }

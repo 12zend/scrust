@@ -2,7 +2,6 @@
 
 use scrust_value::{compare, JsStr, ListIndex, ToNum, ToStr, ToValue, Value};
 
-pub const LIST_ITEM_LIMIT: usize = 200_000;
 
 /// Element representations: `f64`, `bool`, `JsStr` or `Value`.
 pub trait Elem: Clone + ToNum + ToStr + ToValue + 'static {
@@ -10,7 +9,7 @@ pub trait Elem: Clone + ToNum + ToStr + ToValue + 'static {
     fn from_value(v: &Value) -> Self;
     /// `Cast.compare(self, other) === 0`
     fn equals_value(&self, other: &Value) -> bool;
-    /// Is this a *string* of length one (for `data_listcontents`)?
+    /// Is `String(self)` one code unit long (TurboWarp's `listContents`)?
     fn is_single_char(&self) -> bool;
 }
 
@@ -25,7 +24,11 @@ impl Elem for Value {
     }
     #[inline]
     fn is_single_char(&self) -> bool {
-        matches!(self, Value::Str(s) if s.len() == 1)
+        match self {
+            Value::Str(s) => s.len() == 1,
+            Value::Num(n) => n.is_single_char(),
+            Value::Bool(_) => false,
+        }
     }
 }
 impl Elem for f64 {
@@ -46,7 +49,8 @@ impl Elem for f64 {
     }
     #[inline]
     fn is_single_char(&self) -> bool {
-        false
+        // "0".."9" (and -0, which prints as "0").
+        *self >= 0.0 && *self <= 9.0 && *self == self.trunc()
     }
 }
 impl Elem for bool {
@@ -133,12 +137,10 @@ impl<T: Elem> List<T> {
         self.items.is_empty()
     }
 
-    /// `data_addtolist`
+    /// `data_addtolist` (TurboWarp has no 200,000 item limit).
     #[inline]
     pub fn add(&mut self, v: T) {
-        if self.items.len() < LIST_ITEM_LIMIT {
-            self.items.push(v);
-        }
+        self.items.push(v);
     }
 
     /// `data_deleteoflist`
@@ -160,13 +162,7 @@ impl<T: Elem> List<T> {
     /// `data_insertatlist` (`idx` computed against `len + 1`).
     pub fn insert(&mut self, idx: ListIndex, v: T) {
         let ListIndex::Index(i) = idx else { return };
-        if i > LIST_ITEM_LIMIT {
-            return;
-        }
         self.items.insert(i - 1, v);
-        if self.items.len() > LIST_ITEM_LIMIT {
-            self.items.pop();
-        }
     }
 
     /// `data_replaceitemoflist`

@@ -57,3 +57,29 @@ node conformance/bench/run.js
 ## Demo
 
 `node conformance/demo/make.js` writes `conformance/out/demo.sb3` (SVG costumes, pen, clones, effects, sound).
+
+## TurboWarp reference (real projects, with a renderer)
+
+`conformance/twref` runs a TurboWarp scratch-vm checkout with TurboWarp's scratch-render in a browser, deterministically (same clock, seed and one pass per frame as `harness/trace.js`), and saves trace lines and screenshots. Bundle the page (uses the vendored scratch-gui's packages; `SCRUST_REF_VM` defaults to `/Users/kobajin/repo/scratch-vm-develop`):
+
+```bash
+(cd conformance/twref && ../../gui/vendor/scratch-gui/node_modules/.bin/webpack --config webpack.config.js)
+```
+
+Serve it (`.claude/launch.json` has it as `scrust-twref`) and open `http://localhost:8768/?list=*&frames=300&traceEvery=30&every=30` in a browser; results go to `conformance/out/twref/results`:
+
+```bash
+node conformance/twref/serve.js 8768 /path/to/sb3/dir
+```
+
+Then build and run the same projects with scrust and compare (traces line by line, screenshots by mean pixel difference):
+
+```bash
+node conformance/twref/run.js scrust /path/to/sb3/dir --frames 300 --trace-every 30 --every 30
+```
+
+```bash
+node conformance/twref/run.js compare /path/to/sb3/dir --pixels
+```
+
+A built program accepts `--trace-every N` and `--screenshot-every N --screenshot out-%d.png` for this.

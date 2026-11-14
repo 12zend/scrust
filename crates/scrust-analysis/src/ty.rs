@@ -64,7 +64,9 @@ impl Ty {
             Value::Num(n) => Ty::of_number(*n),
             Value::Str(s) => {
                 let n = js_string_to_number(s);
-                if n.is_nan() || s.is_whitespace() {
+                // Strings `Cast.compare` treats as NaN (TurboWarp's
+                // isNotActuallyZero: whitespace with a tab counts as 0).
+                if n.is_nan() || (n == 0.0 && s.is_not_actually_zero()) {
                     let lower = s.to_lower();
                     if lower.eq_str("true") || lower.eq_str("false") {
                         Ty::STR_BOOL

@@ -124,7 +124,8 @@ pub fn init(program: ProgramDef, mut options: Options, scale: f64, seed: u32, ep
     world.tz_offset_min = tz_offset_min;
     world.current_msecs = world.clock_ms();
     world.timer_start = world.current_msecs;
-    let renderer = SoftRenderer::new(program, scale.max(0.25));
+    let mut renderer = SoftRenderer::new(program, scale.max(0.25));
+    renderer.high_quality = world.options.hq;
     let size = renderer.width * renderer.height * 4;
     world.renderer = Some(Box::new(renderer));
     world.audio = Some(Box::new(WebAudio));

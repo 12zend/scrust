@@ -286,22 +286,12 @@ fn substack(cx: &mut Ctx, tc: &TCtx, b: &Block, name: &str, depth: usize) -> Vec
     }
 }
 
-/// Evaluation order of `names` as they appear in the block's inputs.
-fn eval_order(b: &Block, names: &[&str]) -> Vec<usize> {
-    let mut order: Vec<usize> = Vec::new();
-    for (n, _) in &b.inputs {
-        if let Some(i) = names.iter().position(|x| *x == n.as_str()) {
-            if !order.contains(&i) {
-                order.push(i);
-            }
-        }
-    }
-    for i in 0..names.len() {
-        if !order.contains(&i) {
-            order.push(i);
-        }
-    }
-    order
+/// Evaluation order of a block's arguments. TurboWarp's compiler evaluates
+/// them in the order its generated JavaScript names them, which is the
+/// argument order (scratch-vm's interpreter follows the order of the inputs
+/// in project.json instead).
+fn eval_order(_b: &Block, names: &[&str]) -> Vec<usize> {
+    (0..names.len()).collect()
 }
 
 fn var_field(cx: &mut Ctx, tc: &TCtx, b: &Block) -> VarId {
@@ -392,6 +382,10 @@ fn lower_stmt(cx: &mut Ctx, tc: &TCtx, b: &Block, depth: usize, out: &mut Vec<St
         // "all at once" simply runs its branch.
         "control_all_at_once" => Stmt::If(Expr::Lit(Value::Bool(true)), substack(cx, tc, b, "SUBSTACK", depth), Vec::new()),
         "control_wait" => Stmt::Wait(inp!("DURATION")),
+        "music_playNoteForBeats" => Stmt::MusicWait { kind: 0, arg: inp!("NOTE"), beats: inp!("BEATS") },
+        "music_playDrumForBeats" => Stmt::MusicWait { kind: 1, arg: inp!("DRUM"), beats: inp!("BEATS") },
+        "music_midiPlayDrumForBeats" => Stmt::MusicWait { kind: 1, arg: inp!("DRUM"), beats: inp!("BEATS") },
+        "music_restForBeats" => Stmt::MusicWait { kind: 2, arg: Expr::Missing, beats: inp!("BEATS") },
         "control_wait_until" => Stmt::WaitUntil(inp!("CONDITION")),
         "control_stop" => match field_str(b, "STOP_OPTION").as_str() {
             "all" => Stmt::StopAll,
@@ -413,6 +407,9 @@ fn lower_stmt(cx: &mut Ctx, tc: &TCtx, b: &Block, depth: usize, out: &mut Vec<St
             let Some(m) = &b.mutation else { return };
             let ids: Vec<&str> = b.inputs.iter().map(|(n, _)| n.as_str()).collect();
             match tc.proc_index.get(&m.proccode) {
+                // TurboWarp compiles a call to an empty definition to nothing,
+                // without evaluating the arguments (jsgen.js).
+                Some(&pi) if tc.procs[pi].def_block.is_some_and(|bi| tc.target.blocks[bi].next.is_none()) => return,
                 Some(&pi) if tc.procs[pi].def_block.is_some() => {
                     let params = &tc.procs[pi].params;
                     let mut args = Vec::new();
@@ -429,9 +426,10 @@ fn lower_stmt(cx: &mut Ctx, tc: &TCtx, b: &Block, depth: usize, out: &mut Vec<St
                     Stmt::Call { proc: ProcId { target: tc.ti, index: pi }, args, order }
                 }
                 _ => {
-                    // No prototype or no definition: inputs still run, the call is a no-op.
-                    let args: Vec<Expr> = ids.iter().map(|n| inp!(n)).collect();
-                    Stmt::Discard(args)
+                    // No prototype or no definition: TurboWarp emits a no-op and
+                    // does not evaluate the inputs.
+                    let _ = ids;
+                    return;
                 }
             }
         }
@@ -484,8 +482,9 @@ fn lower_input(cx: &mut Ctx, tc: &TCtx, b: &Block, name: &str, depth: usize) -> 
 fn binop(cx: &mut Ctx, tc: &TCtx, b: &Block, op: Op, n1: &str, n2: &str, depth: usize) -> Expr {
     let a = lower_input(cx, tc, b, n1, depth);
     let c = lower_input(cx, tc, b, n2, depth);
-    let order = eval_order(b, &[n1, n2]);
-    let order = if order == [0, 1] || !(a.is_impure() && c.is_impure()) { None } else { Some(order) };
+    // `letter of` compiles to `(STRING)[LETTER - 1]`: the string goes first.
+    let order = if op == Op::LetterOf && a.is_impure() && c.is_impure() { Some(vec![1, 0]) } else { None };
+    let _ = b;
     Expr::Op(op, vec![a, c], order)
 }
 
@@ -526,12 +525,13 @@ fn lower_reporter(cx: &mut Ctx, tc: &TCtx, b: &Block, depth: usize) -> Expr {
         "data_listcontainsitem" => Expr::ListContains(list_field(cx, tc, b), Box::new(inp!("ITEM"))),
         "argument_reporter_string_number" | "argument_reporter_boolean" => {
             let name = field_str(b, "VALUE");
-            match &tc.cur_params {
-                // pushParam stores by name: the last parameter with that name wins.
-                Some(params) => match params.iter().rposition(|p| *p == name) {
-                    Some(i) => Expr::Arg(i),
-                    None => Expr::num(0.0),
-                },
+            // The last parameter with that name wins.
+            let found = tc.cur_params.as_ref().and_then(|params| params.iter().rposition(|p| *p == name));
+            match found {
+                Some(i) => Expr::Arg(i),
+                // TurboWarp (irgen.js): an unbound boolean argument named
+                // "is compiled?" or "is TurboWarp?" is `true`.
+                None if op == "argument_reporter_boolean" && matches!(name.to_lowercase().as_str(), "is compiled?" | "is turbowarp?") => Expr::Lit(Value::Bool(true)),
                 None => Expr::num(0.0),
             }
         }

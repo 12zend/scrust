@@ -110,13 +110,25 @@ table! {
         PenChangeShade = "pen_changePenShadeBy", "pen_change_shade", [I("SHADE", Num)];
         PenSetHue = "pen_setPenHueToNumber", "pen_set_hue", [I("HUE", Num)];
         PenChangeHue = "pen_changePenHueBy", "pen_change_hue", [I("HUE", Num)];
+        MusicSetTempo = "music_setTempo", "music_set_tempo", [I("TEMPO", Num)];
+        MusicChangeTempo = "music_changeTempo", "music_change_tempo", [I("TEMPO", Num)];
+        // Instruments only matter for sound, which scrust does not synthesise.
+        MusicSetInstrument = "music_setInstrument", "noop1", [I("INSTRUMENT", Raw)];
+        MusicMidiSetInstrument = "music_midiSetInstrument", "noop1", [I("INSTRUMENT", Raw)];
     }
 }
 
 impl Cmd {
+    /// Commands whose primitive returns `Promise.resolve()` (sound effects and
+    /// volume with `miscLimits`): the thread waits for the next tick, like any
+    /// promise block. Their runtime method returns `Option<Wake>`.
+    pub fn is_promise(self) -> bool {
+        matches!(self, Cmd::SoundChangeEffect | Cmd::SoundSetEffect | Cmd::SoundChangeVolume | Cmd::SoundSetVolume)
+    }
+
     /// Commands that ask the renderer to redraw (only when a renderer is attached).
     pub fn is_noop(self) -> bool {
-        matches!(self, Cmd::HideAllSprites | Cmd::ChangeStretch | Cmd::SetStretch)
+        matches!(self, Cmd::HideAllSprites | Cmd::ChangeStretch | Cmd::SetStretch | Cmd::MusicSetInstrument | Cmd::MusicMidiSetInstrument)
     }
 }
 
@@ -143,6 +155,10 @@ table! {
         Current = "sensing_current", "current", [F("CURRENTMENU")];
         DaysSince2000 = "sensing_dayssince2000", "days_since_2000", [];
         Username = "sensing_username", "username", [];
+        MusicTempo = "music_getTempo", "music_tempo", [];
+        // Translate extension: the viewer language (no network for translations).
+        ViewerLanguage = "translate_getViewerLanguage", "viewer_language", [];
+        Translate = "translate_getTranslate", "translate", [I("WORDS", Str), I("LANGUAGE", Str)];
         Counter = "control_get_counter", "counter", [];
         // Split from looks_costumenumbername / looks_backdropnumbername by field.
         CostumeNumber = "looks_costumenumbername#number", "costume_number", [];
@@ -159,9 +175,9 @@ impl Rep {
         use Rep::*;
         match self {
             XPosition | YPosition | Direction | Size | Volume | DistanceTo | MouseX | MouseY | Loudness | Timer | Current
-            | DaysSince2000 | Counter | CostumeNumber | BackdropNumber => R::Num,
+            | DaysSince2000 | Counter | CostumeNumber | BackdropNumber | MusicTempo => R::Num,
             TouchingObject | TouchingColor | ColorTouchingColor | KeyPressed | MouseDown | Loud => R::Bool,
-            Answer | Username | CostumeName | BackdropName => R::Str,
+            Answer | Username | CostumeName | BackdropName | ViewerLanguage | Translate => R::Str,
             AttrOf => R::Val,
         }
     }

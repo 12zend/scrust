@@ -400,6 +400,13 @@ fn parse_target(j: &J) -> Target {
         tempo: f(j.get("tempo"), 60.0),
         ..Default::default()
     };
+    if let Some(cs) = j.get("comments").and_then(|v| v.as_object()) {
+        for (_, c) in js_entries(cs) {
+            if let Some(text) = c.get("text").and_then(|v| v.as_str()) {
+                t.comments.push(text.to_string());
+            }
+        }
+    }
     if let Some(vars) = j.get("variables").and_then(|v| v.as_object()) {
         for (id, v) in js_entries(vars) {
             let arr = v.as_array();
@@ -585,5 +592,125 @@ mod tests {
         assert!(matches!(&st.variables[0].value, Value::Str(s) if *s == "007"));
         assert!(matches!(&st.variables[1].value, Value::Num(n) if *n == 7.0));
         assert!(matches!(st.blocks[0].input("VALUE"), Some(Input::Literal(Value::Str(s))) if *s == "1.0"));
+    }
+}
+
+/// TurboWarp's project settings, stored in a stage comment as one line
+/// `{...} // _twconfig_` (`Runtime.parseProjectOptions`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwConfig {
+    pub framerate: Option<f64>,
+    pub turbo: bool,
+    pub interpolation: bool,
+    pub hq: bool,
+    pub max_clones: f64,
+    pub misc_limits: bool,
+    pub fencing: bool,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+}
+
+impl Default for TwConfig {
+    fn default() -> Self {
+        TwConfig { framerate: None, turbo: false, interpolation: false, hq: false, max_clones: 300.0, misc_limits: true, fencing: true, width: None, height: None }
+    }
+}
+
+const TW_CONFIG_MAGIC: &str = " // _twconfig_";
+
+/// `ExtendedJSON.parse`: JSON plus bare `Infinity`, `-Infinity` and `NaN`.
+fn parse_extended_json(text: &str) -> Option<J> {
+    let mut out = String::with_capacity(text.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let mut matched = false;
+        for (tok, rep) in [("-Infinity", "\"\\u0000-inf\""), ("Infinity", "\"\\u0000inf\""), ("NaN", "\"\\u0000nan\"")] {
+            if rest.starts_with(tok) {
+                out.push_str(rep);
+                rest = &rest[tok.len()..];
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    serde_json::from_str(&out).ok()
+}
+
+fn ext_number(v: &J) -> Option<f64> {
+    match v {
+        J::Number(n) => n.as_f64(),
+        J::String(s) if s == "\u{0}inf" => Some(f64::INFINITY),
+        J::String(s) if s == "\u{0}-inf" => Some(f64::NEG_INFINITY),
+        J::String(s) if s == "\u{0}nan" => Some(f64::NAN),
+        _ => None,
+    }
+}
+
+/// JavaScript truthiness of a parsed value.
+fn truthy(v: Option<&J>) -> bool {
+    match v {
+        None | Some(J::Null) => false,
+        Some(J::Bool(b)) => *b,
+        Some(J::String(s)) => !s.is_empty() && s != "\u{0}nan",
+        Some(J::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
+        Some(_) => true,
+    }
+}
+
+impl Project {
+    pub fn tw_config(&self) -> TwConfig {
+        let mut cfg = TwConfig::default();
+        let Some(stage) = self.targets.iter().find(|t| t.is_stage) else { return cfg };
+        let Some(text) = stage.comments.iter().find(|c| c.contains(TW_CONFIG_MAGIC)) else { return cfg };
+        let Some(line) = text.split('\n').find(|l| l.ends_with(TW_CONFIG_MAGIC)) else { return cfg };
+        let Some(J::Object(o)) = parse_extended_json(&line[..line.len() - TW_CONFIG_MAGIC.len()]) else { return cfg };
+        if let Some(J::Number(n)) = o.get("framerate") {
+            cfg.framerate = n.as_f64();
+        }
+        cfg.turbo = truthy(o.get("turbo"));
+        cfg.interpolation = truthy(o.get("interpolation"));
+        cfg.hq = truthy(o.get("hq"));
+        if let Some(J::Object(r)) = o.get("runtimeOptions") {
+            if let Some(n) = r.get("maxClones").and_then(ext_number) {
+                cfg.max_clones = n;
+            }
+            if let Some(J::Bool(b)) = r.get("miscLimits") {
+                cfg.misc_limits = *b;
+            }
+            if let Some(J::Bool(b)) = r.get("fencing") {
+                cfg.fencing = *b;
+            }
+        }
+        // `+parsed.width || this.stageWidth`
+        let dim = |k: &str| o.get(k).and_then(|v| match v {
+            J::Number(n) => n.as_f64(),
+            J::String(s) => s.trim().parse::<f64>().ok(),
+            _ => ext_number(v),
+        }).filter(|n| *n != 0.0 && !n.is_nan());
+        cfg.width = dim("width");
+        cfg.height = dim("height");
+        cfg
     }
 }

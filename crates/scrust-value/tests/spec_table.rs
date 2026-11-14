@@ -292,17 +292,28 @@ fn list_index() {
 }
 
 #[test]
+fn compare_tab_is_zero() {
+    // TurboWarp's isNotActuallyZero: whitespace containing a tab counts as 0.
+    assert_eq!(compare(&s("\t"), &n(0.0)), 0.0);
+    assert!(compare(&s(" "), &n(0.0)) != 0.0);
+    assert!(compare(&s(""), &n(0.0)) != 0.0);
+}
+
+#[test]
 fn listcontents() {
     let a = [s("a"), s("b")];
     assert_eq!(list_contents(a.iter()), "ab");
+    // TurboWarp: the string form decides, so a one-digit number counts.
     let b = [s("a"), n(1.0)];
-    assert_eq!(list_contents(b.iter()), "a 1");
+    assert_eq!(list_contents(b.iter()), "a1");
+    let b2 = [s("a"), n(10.0)];
+    assert_eq!(list_contents(b2.iter()), "a 10");
     let c = [s("ab"), s("c")];
     assert_eq!(list_contents(c.iter()), "ab c");
     let d = [s("1"), s("2")];
     assert_eq!(list_contents(d.iter()), "12");
     let e = [n(1.0), n(2.0)];
-    assert_eq!(list_contents(e.iter()), "1 2");
+    assert_eq!(list_contents(e.iter()), "12");
     let empty: [Value; 0] = [];
     assert_eq!(list_contents(empty.iter()), "");
 }

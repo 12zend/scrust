@@ -446,6 +446,7 @@ impl Analysis {
                 let mut hit = false;
                 walk_stmts(body, &mut |s| match s {
                     Stmt::SayForSecs { .. } | Stmt::Ask(_) | Stmt::PlaySoundUntilDone(_) => hit = true,
+                    Stmt::Cmd(c, ..) if c.is_promise() => hit = true,
                     Stmt::Call { proc, .. } if self.promise_tail.contains(proc) => hit = true,
                     _ => {}
                 });
@@ -510,6 +511,7 @@ impl Analysis {
     pub fn stmt_may_yield(&self, p: &Program, s: &Stmt, warp: bool) -> bool {
         match s {
             Stmt::Wait(_)
+            | Stmt::MusicWait { .. }
             | Stmt::WaitUntil(_)
             | Stmt::BroadcastAndWait(_)
             | Stmt::Glide { .. }
@@ -520,6 +522,7 @@ impl Analysis {
             | Stmt::SwitchBackdropAndWait(_)
             | Stmt::StopAll
             | Stmt::DeleteThisClone => true,
+            Stmt::Cmd(c, ..) if c.is_promise() => true,
             Stmt::Repeat(_, b) | Stmt::Forever(b) | Stmt::RepeatUntil(_, b) | Stmt::While(_, b) | Stmt::ForEach(_, _, b) => {
                 !warp || self.opts.warp_timer || b.iter().any(|x| self.stmt_may_yield(p, x, warp))
             }

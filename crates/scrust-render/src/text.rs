@@ -11,6 +11,9 @@ use scrust_value::{js_number_to_string, js_to_fixed_string, ToStr, Value};
 /// stand in for the families Scratch's costume editor offers.
 pub static EMBEDDED_FONTS: &[&[u8]] = &[
     include_bytes!("../fonts/NotoSans.ttf"),
+    // scratch-render-fonts' NotoSans-Medium (the "Sans Serif" costume font),
+    // renamed so it does not mix with the variable Noto Sans.
+    include_bytes!("../fonts/NotoSans-Medium.ttf"),
     include_bytes!("../fonts/SourceSerif4.ttf"),
     include_bytes!("../fonts/Handlee-Regular.ttf"),
     include_bytes!("../fonts/Knewave-Regular.ttf"),
@@ -20,7 +23,7 @@ pub static EMBEDDED_FONTS: &[&[u8]] = &[
 /// Scratch font family -> embedded family. (`Pixel` has no freely
 /// redistributable counterpart here and falls back to the sans font.)
 const FAMILIES: [(&str, &str); 7] = [
-    ("Sans Serif", "Noto Sans"),
+    ("Sans Serif", "Scratch Sans Serif"),
     ("Serif", "Source Serif 4"),
     ("Handwriting", "Handlee"),
     ("Marker", "Knewave"),
@@ -49,20 +52,24 @@ pub fn map_font_families(svg: &[u8]) -> std::borrow::Cow<'_, [u8]> {
             _ => (None, trimmed),
         };
         let end = body.find(|c: char| Some(c) == quote || c == ';' || (quote.is_none() && c == '"')).unwrap_or(body.len());
-        let value = body[..end].trim().trim_matches(|c| c == '\'' || c == '"');
         if let Some(q) = quote {
             out.push(q);
         }
-        match FAMILIES.iter().find(|(from, _)| value.eq_ignore_ascii_case(from)) {
-            Some((_, to)) => {
-                // Quote the name: CSS identifiers cannot contain a bare "4".
-                let inner = if quote == Some('\'') { '"' } else { '\'' };
-                out.push(inner);
-                out.push_str(to);
-                out.push(inner);
-            }
-            None => out.push_str(&body[..end]),
-        }
+        // A comma-separated family list: map each Scratch family in it (the
+        // browser falls through unknown families to the inlined Scratch font).
+        let inner = if quote == Some('\'') { '"' } else { '\'' };
+        let parts: Vec<String> = body[..end]
+            .split(',')
+            .map(|part| {
+                let name = part.trim().trim_start_matches("&quot;").trim_end_matches("&quot;").trim_matches(|c| c == '\'' || c == '"');
+                match FAMILIES.iter().find(|(from, _)| name.eq_ignore_ascii_case(from)) {
+                    // Quote the name: CSS identifiers cannot contain a bare "4".
+                    Some((_, to)) => format!("{inner}{to}{inner}"),
+                    None => part.to_string(),
+                }
+            })
+            .collect();
+        out.push_str(&parts.join(","));
         rest = &body[end..];
     }
     out.push_str(rest);
@@ -75,12 +82,24 @@ pub fn load_fonts(db: &mut usvg::fontdb::Database) {
     }
     // System fonts provide glyphs the embedded ones lack (CJK, emoji).
     #[cfg(not(target_arch = "wasm32"))]
-    db.load_system_fonts();
+    {
+        db.load_system_fonts();
+        // macOS's LastResort font has a box for every code point; picked as
+        // a fallback, it turns whole text runs (e.g. one with an emoji) into
+        // boxes. Browsers never draw with it.
+        let last: Vec<_> = db.faces().filter(|f| f.families.iter().any(|(n, _)| n.trim_start_matches('.') == "LastResort")).map(|f| f.id).collect();
+        for id in last {
+            db.remove_face(id);
+        }
+    }
     db.set_sans_serif_family("Noto Sans");
     db.set_serif_family("Source Serif 4");
 }
 
 pub fn configure(opt: &mut usvg::Options) {
+    // scratch-svg-renderer's `transformImages` renders embedded images
+    // pixelated.
+    opt.image_rendering = usvg::ImageRendering::OptimizeSpeed;
     let family = opt.fontdb.faces().next().map(|_| opt.fontdb.family_name(&usvg::fontdb::Family::SansSerif).to_string());
     if let Some(f) = family {
         opt.font_family = f;
@@ -118,26 +137,24 @@ fn width(s: &str, font: f64) -> f64 {
     s.chars().map(em).sum::<f64>() * font
 }
 
-/// Greedy word wrap to `max` pixels.
-fn wrap(text: &str, font: f64, max: f64) -> Vec<String> {
+/// Greedy word wrap to `max` pixels with a width function.
+fn wrap_with(text: &str, max: f64, width_of: &dyn Fn(&str) -> f64) -> Vec<String> {
     let mut lines = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
         for word in para.split(' ') {
             let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if width(&candidate, font) <= max || line.is_empty() {
+            if width_of(&candidate) <= max || line.is_empty() {
                 line = candidate;
             } else {
                 lines.push(std::mem::take(&mut line));
                 line = word.to_string();
             }
             // Break words that are longer than a whole line.
-            while width(&line, font) > max {
+            while width_of(&line) > max {
                 let mut cut = 0;
-                let mut acc = 0.0;
                 for (i, c) in line.char_indices() {
-                    acc += em(c) * font;
-                    if acc > max {
+                    if width_of(&line[..i + c.len_utf8()]) > max {
                         break;
                     }
                     cut = i + c.len_utf8();
@@ -174,45 +191,94 @@ fn svg_open(w: f64, h: f64, scale: f64) -> String {
     )
 }
 
-pub fn bubble(text: &str, think: bool, scale: f64, opt: &usvg::Options) -> Raster {
-    const FONT: f64 = 14.0;
-    const PAD: f64 = 10.0;
-    const LINE: f64 = 16.0;
-    const TAIL: f64 = 12.0;
-    let lines = wrap(text, FONT, 170.0);
-    let text_w = lines.iter().map(|l| width(l, FONT)).fold(0.0, f64::max).max(30.0);
-    let w = text_w + 2.0 * PAD + 2.0;
-    let body_h = lines.len() as f64 * LINE + 2.0 * PAD;
-    let h = body_h + TAIL + 2.0;
+/// scratch-render's `TextBubbleSkin` style.
+pub const BUBBLE_MAX_LINE: f64 = 170.0;
+const BUBBLE_MIN_WIDTH: f64 = 50.0;
+const BUBBLE_STROKE: f64 = 4.0;
+const BUBBLE_PAD: f64 = 10.0;
+const BUBBLE_RADIUS: f64 = 16.0;
+const BUBBLE_TAIL: f64 = 12.0;
+const BUBBLE_FONT: f64 = 14.0;
+const BUBBLE_LINE: f64 = 16.0;
+
+/// The bubble font (`14px Helvetica, sans-serif`): (fontdb face, units per em).
+fn bubble_face(opt: &usvg::Options) -> Option<usvg::fontdb::ID> {
+    use usvg::fontdb::{Family, Query};
+    opt.fontdb.query(&Query { families: &[Family::Name("Helvetica"), Family::SansSerif], ..Default::default() })
+}
+
+/// `measureText(s).width` for the bubble font.
+pub fn bubble_text_width(s: &str, opt: &usvg::Options) -> f64 {
+    let Some(id) = bubble_face(opt) else { return width(s, BUBBLE_FONT) };
+    opt.fontdb
+        .with_face_data(id, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            let upem = face.units_per_em() as f64;
+            let mut w = 0.0;
+            for c in s.chars() {
+                let adv = face.glyph_index(c).and_then(|g| face.glyph_hor_advance(g)).map(|a| a as f64).unwrap_or(upem * em(c));
+                w += adv;
+            }
+            Some(w / upem * BUBBLE_FONT)
+        })
+        .flatten()
+        .unwrap_or_else(|| width(s, BUBBLE_FONT))
+}
+
+/// Size of a bubble in stage units (`TextBubbleSkin.size`) and its lines.
+pub fn bubble_layout(text: &str, opt: &usvg::Options) -> (Vec<String>, f64, f64) {
+    let lines = wrap_with(text, BUBBLE_MAX_LINE, &|l| bubble_text_width(l, opt));
+    let longest = lines.iter().map(|l| bubble_text_width(l, opt)).fold(0.0, f64::max);
+    let padded_w = longest.max(BUBBLE_MIN_WIDTH) + BUBBLE_PAD * 2.0;
+    let padded_h = BUBBLE_LINE * lines.len() as f64 + BUBBLE_PAD * 2.0;
+    (lines, padded_w, padded_h)
+}
+
+/// `TextBubbleSkin._renderTextBubble`.
+pub fn bubble(text: &str, think: bool, points_left: bool, scale: f64, opt: &usvg::Options) -> Raster {
+    let (lines, pw, ph) = bubble_layout(text, opt);
+    let (w, h) = (pw + BUBBLE_STROKE, ph + BUBBLE_STROKE + BUBBLE_TAIL);
+    let r = BUBBLE_RADIUS;
     let mut s = svg_open(w, h, scale);
-    s.push_str(&format!(
-        r##"<rect x="1" y="1" width="{}" height="{}" rx="16" ry="16" fill="#ffffff" stroke="#b9c0cc" stroke-width="1.5"/>"##,
-        w - 2.0,
-        body_h
-    ));
-    if think {
-        s.push_str(&format!(
-            r##"<circle cx="18" cy="{}" r="4.5" fill="#ffffff" stroke="#b9c0cc" stroke-width="1.5"/><circle cx="10" cy="{}" r="2.5" fill="#ffffff" stroke="#b9c0cc" stroke-width="1.5"/>"##,
-            body_h + 5.0,
-            body_h + 10.5
-        ));
+    let flip = if points_left { format!(r#" transform="translate({pw},0) scale(-1,1)""#) } else { String::new() };
+    // Rounded body (canvas `arcTo`s) and the tail, translated to (pw - r, ph).
+    let (tx, ty) = (pw - r, ph);
+    let tail = if think {
+        format!(
+            "A 4 4 0 0 1 {} {} Z M {} {} A 2.25 2.25 0 1 1 {} {} A 2.25 2.25 0 1 1 {} {} M {} {} A 1.5 1.5 0 1 1 {} {} A 1.5 1.5 0 1 1 {} {}",
+            tx - 20.0, ty,
+            tx - 7.0, ty + 7.25, tx - 11.5, ty + 7.25, tx - 7.0, ty + 7.25,
+            tx, ty + 9.5, tx - 3.0, ty + 9.5, tx, ty + 9.5
+        )
     } else {
-        s.push_str(&format!(
-            r##"<path d="M 14 {y} L 10 {t} L 28 {y} Z" fill="#ffffff" stroke="#b9c0cc" stroke-width="1.5"/><rect x="13" y="{c}" width="16" height="3" fill="#ffffff"/>"##,
-            y = body_h + 0.5,
-            t = body_h + TAIL,
-            c = body_h - 1.5
-        ));
-    }
+        format!(
+            "C {} {} {} {} {} {} A 2 2 0 0 1 {} {} C {} {} {} {} {} {} Z",
+            tx, ty + 4.0, tx + 4.0, ty + 8.0, tx + 4.0, ty + 10.0,
+            tx + 2.0, ty + 12.0,
+            tx - 1.0, ty + 12.0, tx - 11.0, ty + 8.0, tx - 16.0, ty
+        )
+    };
+    let think_start = if think { format!(" L {} {}", tx - 12.0, ty) } else { String::new() };
+    let d = format!(
+        "M {r} {ph} A {r} {r} 0 0 1 0 {a} L 0 {r} A {r} {r} 0 0 1 {r} 0 L {b} 0 A {r} {r} 0 0 1 {pw} {r} L {pw} {a} A {r} {r} 0 0 1 {b} {ph}{think_start} {tail}",
+        a = ph - r,
+        b = pw - r
+    );
+    s.push_str(&format!(
+        r##"<g transform="translate({o},{o})"><g{flip}><path d="{d}" fill="#ffffff" stroke="rgba(0,0,0,0.15)" stroke-width="{sw}" paint-order="stroke"/></g>"##,
+        o = BUBBLE_STROKE * 0.5,
+        sw = BUBBLE_STROKE
+    ));
     for (i, l) in lines.iter().enumerate() {
         s.push_str(&format!(
-            r##"<text x="{}" y="{}" font-size="{}" fill="#575e75" xml:space="preserve">{}</text>"##,
-            PAD + 1.0,
-            PAD + 1.0 + (i as f64 + 0.8) * LINE,
-            FONT,
+            r##"<text x="{}" y="{}" font-family="Helvetica, sans-serif" font-size="{}" fill="#575e75" xml:space="preserve">{}</text>"##,
+            BUBBLE_PAD,
+            BUBBLE_PAD + BUBBLE_LINE * i as f64 + 0.9 * BUBBLE_FONT,
+            BUBBLE_FONT,
             esc(l)
         ));
     }
+    s.push_str("</g>");
     s.push_str("</svg>");
     render(&s, opt)
 }

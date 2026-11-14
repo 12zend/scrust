@@ -120,7 +120,13 @@ impl World {
         let tid = self.sched.next_tid;
         self.sched.next_tid += 1;
         let sprite = self.targets[target.idx as usize].sprite;
-        let start = self.program.sprites[sprite].scripts[script].start;
+        let def = &self.program.sprites[sprite].scripts[script];
+        let start = def.start;
+        for c in def.creates {
+            if !self.created[sprite].contains(c) {
+                self.created[sprite].push(*c);
+            }
+        }
         Thread {
             tid,
             target,
@@ -459,6 +465,10 @@ pub unsafe fn step(wp: *mut World) {
         w.sched.redraw_requested = false;
     }
     step_threads(wp);
+    {
+        let w = &mut *wp;
+        w.with_renderer(|r, w| r.frame_drawn(w));
+    }
     (*wp).frame += 1;
 }
 
@@ -475,6 +485,10 @@ unsafe fn step_threads(wp: *mut World) {
     let mut ran_first_tick = false;
     let mut passes: u32 = 0;
     (*wp).sched.abort_tick = false;
+    // `_pushMonitors` queues one thread per visible monitor before stepping;
+    // they finish in the first pass and change nothing but keep the thread
+    // list non-empty for it.
+    let monitor_threads = (*wp).monitor_visible.iter().any(|v| *v);
     'tick: loop {
         {
             let w = &mut *wp;
@@ -482,7 +496,7 @@ unsafe fn step_threads(wp: *mut World) {
                 Some(n) => passes < n,
                 None => w.real_ms() - w.sched.step_start < work_time,
             };
-            if w.sched.threads.is_empty() || num_active == 0 || !time_ok || !(w.options.turbo || !w.sched.redraw_requested) {
+            if (w.sched.threads.is_empty() && !(monitor_threads && passes == 0)) || num_active == 0 || !time_ok || !(w.options.turbo || !w.sched.redraw_requested) {
                 break;
             }
             w.sched.in_pass = true;

@@ -9,6 +9,8 @@ use std::io::Write;
 pub struct Args {
     pub options: Options,
     pub trace: Option<u64>,
+    /// With `--trace`: print only every Nth frame's line.
+    pub trace_every: u64,
     pub frames: Option<u64>,
     pub bench: bool,
     pub print_say: bool,
@@ -17,7 +19,7 @@ pub struct Args {
 
 /// Parse the common run-time flags. Unknown flags are returned untouched.
 pub fn parse_args(mut options: Options, argv: &[String]) -> (Args, Vec<String>) {
-    let mut a = Args { options: options.clone(), trace: None, frames: None, bench: false, print_say: false, virtual_audio: false };
+    let mut a = Args { options: options.clone(), trace: None, trace_every: 1, frames: None, bench: false, print_say: false, virtual_audio: false };
     let mut rest = Vec::new();
     let mut i = 0;
     let next = |i: &mut usize| -> Option<String> {
@@ -27,6 +29,7 @@ pub fn parse_args(mut options: Options, argv: &[String]) -> (Args, Vec<String>) 
     while i < argv.len() {
         match argv[i].as_str() {
             "--trace" => a.trace = next(&mut i).and_then(|v| v.parse().ok()),
+            "--trace-every" => a.trace_every = next(&mut i).and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
             "--frames" => a.frames = next(&mut i).and_then(|v| v.parse().ok()),
             "--seed" => options.seed = next(&mut i).and_then(|v| v.parse().ok()).unwrap_or(1),
             "--fps" => options.fps = next(&mut i).and_then(|v| v.parse().ok()).unwrap_or(30.0),
@@ -93,7 +96,7 @@ pub fn main(program: ProgramDef, defaults: Options) {
         // SAFETY: `w` is only accessed through `wp` while stepping.
         unsafe { crate::sched::step(wp) };
         done_frames += 1;
-        if trace {
+        if trace && done_frames % args.trace_every == 0 {
             let _ = writeln!(out, "{}", w.trace_line());
         }
         if print_say {

@@ -1,6 +1,6 @@
 # scrust
 
-Scratch 3 → Rust ahead-of-time compiler. `scrust` reads a `.sb3`, generates a Cargo crate and builds it into a native executable or a WebAssembly page. The specification is [PRODUCT.md](PRODUCT.md); the reference for behaviour is vanilla scratch-vm at the commits in [REFERENCE.lock](REFERENCE.lock).
+Scratch 3 → Rust ahead-of-time compiler. `scrust` reads a `.sb3`, generates a Cargo crate and builds it into a native executable or a WebAssembly page. The specification is [PRODUCT.md](PRODUCT.md); the reference for behaviour is normal TurboWarp (compiler on, default settings), see [docs/decisions/turbowarp.md](docs/decisions/turbowarp.md).
 
 ```
 project.sb3 ─parse─▶ AST ─lower─▶ IR ─analysis─▶ typed IR ─codegen─▶ Rust crate ─cargo─▶ exe / wasm

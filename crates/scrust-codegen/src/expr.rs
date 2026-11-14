@@ -375,6 +375,13 @@ impl<'a> Gen<'a> {
 
     fn op(&mut self, e: &Expr, op: Op, args: &[Expr], order: Option<&[usize]>, cx: &Cx) -> E {
         let ty = self.an.ty_of(e, cx.owner);
+        // TurboWarp folds `pick random` between two equal literal inputs
+        // (irgen.js) without drawing a random number.
+        if let (Op::Random, [Expr::Lit(a), Expr::Lit(b)]) = (op, args) {
+            if a.to_num() == b.to_num() {
+                return E::lit(Value::Num(a.to_num()));
+            }
+        }
         let xs: Vec<E> = args.iter().map(|a| self.expr(a, cx)).collect();
         // A non-default evaluation order only matters when it was recorded
         // (both operands consume randomness): evaluate into temporaries.
@@ -462,13 +469,10 @@ impl<'a> Gen<'a> {
             }
             Op::And | Op::Or => {
                 let sym = if op == Op::And { "&&" } else { "||" };
-                // Scratch evaluates both operands; short-circuiting is only
-                // unobservable when the right operand is pure.
-                let code = if xs[1].code.contains("random") || xs[1].code.contains("list_index") {
-                    format!("{{ let p_ = {}; let q_ = {}; p_ {} q_ }}", xs[0].bool(), xs[1].bool(), sym)
-                } else {
-                    format!("({} {} {})", xs[0].bool(), sym, xs[1].bool())
-                };
+                // TurboWarp compiles these to JavaScript's `&&` / `||`, so the
+                // right operand is only evaluated when needed (observable
+                // through `pick random`).
+                let code = format!("({} {} {})", xs[0].bool(), sym, xs[1].bool());
                 E::new(code, RT::Bool, Ty::BOOLEAN)
             }
             Op::Not => E::new(format!("(!{})", xs[0].bool()), RT::Bool, Ty::BOOLEAN),
@@ -478,6 +482,7 @@ impl<'a> Gen<'a> {
             Op::Contains => E::new(format!("ops::contains(&{}, &{})", xs[0].str(), xs[1].str()), RT::Bool, Ty::BOOLEAN),
             Op::Random => {
                 let (a, b) = (&xs[0], &xs[1]);
+
                 let simple = |x: &E| x.lit.is_some() || x.rt == RT::Num || x.rt == RT::Bool;
                 let code = if simple(a) && simple(b) {
                     // Raw values are bound once: `isInt` looks at the uncast operands.

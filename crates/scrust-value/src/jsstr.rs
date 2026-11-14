@@ -373,6 +373,11 @@ impl JsStr {
         self.flat().units().all(crate::num::is_js_whitespace)
     }
 
+    /// TurboWarp's `isNotActuallyZero`: no ASCII digit and no tab.
+    pub fn is_not_actually_zero(&self) -> bool {
+        !self.flat().units().any(|u| (0x30..=0x39).contains(&u) || u == 9)
+    }
+
     pub fn to_utf16(&self) -> Vec<u16> {
         self.flat().units().collect()
     }

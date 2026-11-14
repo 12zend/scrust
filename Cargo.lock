@@ -1948,6 +1948,7 @@ dependencies = [
  "resvg",
  "scrust-runtime",
  "scrust-value",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -1971,6 +1972,7 @@ dependencies = [
 name = "scrust-value"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "libm",
 ]
 

@@ -67,7 +67,10 @@ Scratch の値は JS の値そのもの（`number`/`string`/`boolean`）であ�
 | `Number.prototype.toFixed(10)` + `parseFloat` | `sin`/`cos`/`tan` | 正確な10進丸め（タイは大きい方）を実装 |
 | `JSON.parse` | sb3 読み込み | オブジェクトキー順序（整数風キーが先頭）を再現 |
 
-### 2.3 バニラと TurboWarp の既知の差（scrust はバニラに従う）
+### 2.3 バニラと TurboWarp の既知の差
+
+> **改訂:** 挙動の正は通常の TurboWarp（コンパイラ有効・既定設定）に変更した。下表の差は TurboWarp に合わせてあり、追加で見つかった差を含め [docs/decisions/turbowarp.md](docs/decisions/turbowarp.md) に一覧がある。検証は `conformance/twref`（TurboWarp + scratch-render をブラウザで決定的に実行）で行う。以下は当初の記述。
+
 | 項目 | バニラ | TurboWarp | scrust 既定 |
 |---|---|---|---|
 | リスト内容の文字列化（`data_listcontents`） | 全要素が **型 string かつ長さ1** なら区切りなし、それ以外は空白区切り | `String(item).length === 1` で判定（数値 `1` も1文字扱い） | **バニラ**。ただし §8.6 の「正準数値文字列の消去」をこの経路では無効化 |

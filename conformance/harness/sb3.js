@@ -11,6 +11,18 @@
 // *string* form the Scratch editor writes ([4, "10"]). Use b.raw(10) for a
 // genuine JSON number.
 
+// jszip from the vendored scratch-vm, SCRUST_REF_VM, or the vendored scratch-gui.
+function requireJSZip () {
+    const path = require('path');
+    const roots = [path.join(__dirname, '..', 'vendor', 'scratch-vm'), process.env.SCRUST_REF_VM, path.join(__dirname, '..', '..', 'gui', 'vendor', 'scratch-gui')];
+    for (const r of roots.filter(Boolean)) {
+        try {
+            return require(path.join(r, 'node_modules', 'jszip'));
+        } catch (e) { /* next */ }
+    }
+    throw new Error('jszip not found (npm install in gui/vendor/scratch-gui)');
+}
+
 const EMPTY_SVG_MD5 = 'cd21514d0531fdffb22204e0ec5ed84a';
 
 class Target {
@@ -169,7 +181,7 @@ class Project {
     }
     // A complete .sb3 archive (Promise<Buffer>).
     sb3 () {
-        const JSZip = require('../vendor/scratch-vm/node_modules/jszip');
+        const JSZip = requireJSZip();
         const zip = new JSZip();
         zip.file('project.json', this.json());
         const EMPTY = '<svg version="1.1" width="2" height="2" viewBox="-1 -1 2 2" xmlns="http://www.w3.org/2000/svg"></svg>';

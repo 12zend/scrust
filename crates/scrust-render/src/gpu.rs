@@ -12,7 +12,7 @@
 //! the texture) otherwise, and premultiplied "over" blending.
 
 use crate::skin::{Raster, Skin};
-use crate::{Draw, STAGE_HEIGHT, STAGE_WIDTH};
+use crate::{Draw, stage_height, stage_width};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -20,7 +20,7 @@ use objc2_metal::{
     MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
     MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLSize, MTLStorageMode,
-    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage, MTLViewport,
 };
 use objc2_core_foundation::CGSize;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
@@ -37,22 +37,11 @@ const SHADERS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// Per drawable. m: model matrix (m00, m01, m10, m11); t: translation and the
-// stage's half size; size: skin size (stage units), distort, recolor;
+// Per drawable. size: skin size (stage units), distort, recolor;
 // fxa: color, fisheye, whirl, pixelate; fxb: mosaic, brightness, ghost.
-struct Sprite { float4 m; float4 t; float4 size; float4 fxa; float4 fxb; };
+struct Sprite { float4 size; float4 fxa; float4 fxb; };
 
 struct SpriteOut { float4 pos [[position]]; float2 uv; };
-
-vertex SpriteOut sprite_vs(uint vid [[vertex_id]], constant Sprite& s [[buffer(0)]]) {
-    float2 uv = float2(float(vid & 1), float(vid >> 1));
-    float2 l = float2(0.5 - uv.x, uv.y - 0.5);
-    float2 w = float2(s.m.x * l.x + s.m.y * l.y + s.t.x, s.m.z * l.x + s.m.w * l.y + s.t.y);
-    SpriteOut o;
-    o.pos = float4(w.x / s.t.z, w.y / s.t.w, 0.0, 1.0);
-    o.uv = uv;
-    return o;
-}
 
 float2 effect_point(float2 uv, constant Sprite& s) {
     float mosaic = s.fxb.x, pixelate = s.fxa.w, whirl = s.fxa.z, fisheye = s.fxa.y;
@@ -138,6 +127,16 @@ fragment float4 sprite_fs(SpriteOut in [[stage_in]], constant Sprite& s [[buffer
     return c;
 }
 
+// A drawable as scratch-render draws it: six vertices (two triangles in
+// its `_createGeometry` order) whose clip positions were computed on the CPU
+// in float32 like its vertex shader; xy = clip position, zw = a_texCoord.
+vertex SpriteOut tw_vs(uint vid [[vertex_id]], constant float4* v [[buffer(1)]]) {
+    SpriteOut o;
+    o.pos = float4(v[vid].xy, 0.0, 1.0);
+    o.uv = v[vid].zw;
+    return o;
+}
+
 // Screen-aligned textured rectangle (pen layer, bubbles, monitors), in NDC.
 struct Rect { float4 r; };
 
@@ -155,46 +154,53 @@ fragment float4 rect_fs(SpriteOut in [[stage_in]], texture2d<float> tex [[textur
 
 // Pen line: a round-capped segment in device pixels, anti-aliased by
 // distance (p: endpoints; color: straight RGBA; misc: radius, target size).
-struct Line { float4 p; float4 color; float4 misc; };
-
+// scratch-render's pen line (sprite.vert / sprite.frag, DRAW_MODE_line):
+// per instance the premultiplied colour, (thickness, length, stage size)
+// and the pen points (x0, -y0, dx, -dy) in device pixels from the centre.
+struct Line { float4 color; float4 tl; float4 pts; };
 struct LineOut {
     float4 pos [[position]];
-    float2 a [[flat]]; float2 b [[flat]]; float r [[flat]]; float4 color [[flat]];
+    float2 tc;
+    float4 color;
+    float thickness;
+    float length;
 };
-
 vertex LineOut line_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Line* lines [[buffer(0)]]) {
     Line l = lines[iid];
-    float2 a = l.p.xy, b = l.p.zw;
-    float r = l.misc.x;
-    float2 d = b - a;
-    float len = length(d);
-    float2 dir = len > 1e-4 ? d / len : float2(1.0, 0.0);
-    float2 n = float2(-dir.y, dir.x);
-    float e = r + 1.0;
-    float2 c = ((vid & 1) ? b + dir * e : a - dir * e) + n * ((vid >> 1) ? e : -e);
+    const float epsilon = 1e-3;
+    float2 a_position = float2(float((vid & 1) == 0), float(vid >> 1));
+    float2 position = a_position;
+    float expandedRadius = (l.tl.x * 0.5) + 1.4142135623730951;
     LineOut o;
-    o.pos = float4(c.x / l.misc.y * 2.0 - 1.0, 1.0 - c.y / l.misc.z * 2.0, 0.0, 1.0);
-    o.a = a; o.b = b; o.r = r; o.color = l.color;
+    o.tc.x = mix(0.0, l.tl.y + (expandedRadius * 2.0), a_position.x) - expandedRadius;
+    o.tc.y = ((a_position.y - 0.5) * expandedRadius) + 0.5;
+    position.x *= l.tl.y + (2.0 * expandedRadius);
+    position.y *= 2.0 * expandedRadius;
+    position -= expandedRadius;
+    float2 pointDiff = l.pts.zw;
+    pointDiff.x = (abs(pointDiff.x) < epsilon && abs(pointDiff.y) < epsilon) ? epsilon : pointDiff.x;
+    float2 normalized = pointDiff / max(l.tl.y, epsilon);
+    position = float2x2(float2(normalized.x, normalized.y), float2(-normalized.y, normalized.x)) * position;
+    position += l.pts.xy;
+    position *= 2.0 / l.tl.zw;
+    // The pen texture is top down: GL's y as ANGLE stores it.
+    o.pos = float4(position.x, -position.y, 0.0, 1.0);
+    o.color = l.color;
+    o.thickness = l.tl.x;
+    o.length = l.tl.y;
     return o;
 }
-
 fragment float4 line_fs(LineOut in [[stage_in]]) {
-    float2 p = in.pos.xy;
-    float2 ab = in.b - in.a;
-    float t = dot(ab, ab) > 0.0 ? clamp(dot(p - in.a, ab) / dot(ab, ab), 0.0, 1.0) : 0.0;
-    float dist = length(p - (in.a + t * ab));
-    float cover = clamp(in.r + 0.5 - dist, 0.0, 1.0);
-    if (cover <= 0.0) discard_fragment();
-    float alpha = in.color.a * cover;
-    return float4(in.color.rgb * alpha, alpha);
+    float d = ((in.tc.x - clamp(in.tc.x, 0.0, in.length)) * 0.5) + 0.5;
+    float line = distance(float2(0.5), float2(d, in.tc.y)) * 2.0;
+    line -= ((in.thickness - 1.0) * 0.5);
+    return in.color * clamp(1.0 - line, 0.0, 1.0);
 }
 "#;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SpriteUniforms {
-    m: [f32; 4],
-    t: [f32; 4],
     size: [f32; 4],
     fxa: [f32; 4],
     fxb: [f32; 4],
@@ -203,9 +209,9 @@ struct SpriteUniforms {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct LineInstance {
-    p: [f32; 4],
     color: [f32; 4],
-    misc: [f32; 4],
+    tl: [f32; 4],
+    pts: [f32; 4],
 }
 
 #[derive(Clone)]
@@ -213,6 +219,9 @@ struct Quad {
     tex: Tex,
     u: SpriteUniforms,
     nearest: bool,
+    /// scratch-render's six vertices (clip xy, texcoord) and the viewport.
+    verts: [[f32; 4]; 6],
+    viewport: MTLViewport,
 }
 
 enum Item {
@@ -284,12 +293,60 @@ fn pipeline_with(device: &ProtocolObject<dyn MTLDevice>, lib: &ProtocolObject<dy
     device.newRenderPipelineStateWithDescriptor_error(&desc).ok()
 }
 
+/// scratch-render's `penStamp` geometry: the viewport is the drawable's fast
+/// bounds `(left, right, bottom, top)` in stage units, scaled to device pixels
+/// and snapped outwards, and the projection is `ortho` over those bounds
+/// (top and bottom swapped: the pen framebuffer is stored top down). The
+/// vertex shader's `u_projectionMatrix * u_modelMatrix * vec4(a_position, 0, 1)`
+/// is evaluated here in float32, so pixel centres that fall exactly on
+/// texel or quad edges pick the same texel and coverage as in the browser.
+fn tw_stamp_vertices(d: &Draw, scale: f64, bounds: (f64, f64, f64, f64)) -> Option<([[f32; 4]; 6], MTLViewport)> {
+    let (l, r, b, t) = bounds;
+    let (l, r, b, t) = ((l * scale).floor(), (r * scale).ceil(), (b * scale).floor(), (t * scale).ceil());
+    if r - l <= 0.0 || t - b <= 0.0 {
+        return None;
+    }
+    let vp = MTLViewport {
+        originX: stage_width() / 2.0 * scale + l,
+        originY: stage_height() / 2.0 * scale - t,
+        width: r - l,
+        height: t - b,
+        znear: 0.0,
+        zfar: 1.0,
+    };
+    // twgl.m4.ortho(left, right, bottom = top, top = bottom)
+    let (ol, or, ob, ot) = (l / scale, r / scale, t / scale, b / scale);
+    let p0 = (2.0 / (or - ol)) as f32;
+    let p5 = (2.0 / (ot - ob)) as f32;
+    let p12 = ((or + ol) / (ol - or)) as f32;
+    let p13 = ((ot + ob) / (ob - ot)) as f32;
+    Some((tw_clip(&d.xf, p0, p5, p12, p13, true), vp))
+}
+
+/// Clip positions of scratch-render's quad: `P * M * vec4(a_position, 0, 1)`
+/// in float32, with P an orthographic projection (p0, p5, p12, p13) and M the
+/// drawable's float32 model matrix. `flip` negates y: ANGLE stores a GL
+/// framebuffer's row 0 as the Metal texture's row 0, so Metal's y-up clip
+/// space is the GL one upside down.
+fn tw_clip(xf: &crate::Xf, p0: f32, p5: f32, p12: f32, p13: f32, flip: bool) -> [[f32; 4]; 6] {
+    let (m0, m1, m4, m5, m12, m13) = (xf.m00 as f32, xf.m10 as f32, xf.m01 as f32, xf.m11 as f32, xf.tx as f32, xf.ty as f32);
+    // P * M (column-major, as GLSL multiplies mat4s); the zero terms are exact.
+    let (pm0, pm1, pm4, pm5) = (p0 * m0, p5 * m1, p0 * m4, p5 * m5);
+    let (pm12, pm13) = (p0 * m12 + p12, p5 * m13 + p13);
+    // a_position, a_texCoord (RenderWebGL._createGeometry)
+    const QUAD: [[f32; 4]; 6] = [[-0.5, -0.5, 1.0, 0.0], [0.5, -0.5, 0.0, 0.0], [-0.5, 0.5, 1.0, 1.0], [-0.5, 0.5, 1.0, 1.0], [0.5, -0.5, 0.0, 0.0], [0.5, 0.5, 0.0, 1.0]];
+    let sign = if flip { -1.0 } else { 1.0 };
+    QUAD.map(|[ax, ay, u, v]| [pm0 * ax + pm4 * ay + pm12, sign * (pm1 * ax + pm5 * ay + pm13), u, v])
+}
+
 fn sampler(device: &ProtocolObject<dyn MTLDevice>, filter: MTLSamplerMinMagFilter) -> Option<Sampler> {
     let desc = MTLSamplerDescriptor::new();
     desc.setMinFilter(filter);
     desc.setMagFilter(filter);
-    desc.setSAddressMode(MTLSamplerAddressMode::ClampToZero);
-    desc.setTAddressMode(MTLSamplerAddressMode::ClampToZero);
+    // scratch-render creates skin textures with CLAMP_TO_EDGE: a pixel centre
+    // exactly on the quad's edge may sample just outside [0, 1].
+    desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
+    desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
     device.newSamplerStateWithDescriptor(&desc)
 }
 
@@ -353,7 +410,7 @@ impl Gpu {
         };
         let (w, h) = (width.max(1), height.max(1));
         let mut gpu = Gpu {
-            sprite: pipeline(&device, &lib, "sprite_vs", "sprite_fs")?,
+            sprite: pipeline(&device, &lib, "tw_vs", "sprite_fs")?,
             rect: pipeline(&device, &lib, "rect_vs", "rect_fs")?,
             line: pipeline(&device, &lib, "line_vs", "line_fs")?,
             linear: sampler(&device, MTLSamplerMinMagFilter::Linear)?,
@@ -419,21 +476,25 @@ impl Gpu {
 
     /// Uniforms and sampling for drawing `d` at `scale` device pixels per stage unit.
     fn quad(&mut self, skin: &mut Skin, d: &Draw, scale: f64) -> Option<Quad> {
+        if d.degenerate() {
+            return None;
+        }
         // Same raster choice as `composite`: the MIP level for the drawable's
-        // on-screen density, sampled nearest when distorted or exactly 1:1.
+        // on-screen density, sampled as `Skin.useNearest` decides.
         let unit = (d.xf.m00.hypot(d.xf.m10) / d.size.0.max(1e-9)).max(d.xf.m01.hypot(d.xf.m11) / d.size.1.max(1e-9));
         let (tex, tw, th) = self.skin_texture(skin, unit * scale)?;
-        let b = d.xf.aabb();
-        let exact = tw as f64 == (b.right - b.left) * scale && th as f64 == (b.top - b.bottom) * scale;
         let fx = d.fx;
         let u = SpriteUniforms {
-            m: [d.xf.m00 as f32, d.xf.m01 as f32, d.xf.m10 as f32, d.xf.m11 as f32],
-            t: [d.xf.tx as f32, d.xf.ty as f32, (STAGE_WIDTH / 2.0) as f32, (STAGE_HEIGHT / 2.0) as f32],
             size: [d.size.0 as f32, d.size.1 as f32, fx.distorts() as u8 as f32, fx.recolors() as u8 as f32],
             fxa: [fx.color as f32, fx.fisheye as f32, fx.whirl as f32, fx.pixelate as f32],
             fxb: [fx.mosaic as f32, fx.brightness as f32, fx.ghost as f32, 0.0],
         };
-        Some(Quad { tex, u, nearest: exact || fx.distorts() })
+        let _ = (tw, th);
+        // Drawn to the stage: `ortho(-w/2, w/2, -h/2, h/2)` over the whole target.
+        let (hw, hh) = (stage_width() / 2.0, stage_height() / 2.0);
+        // The stage target is stored bottom up like WebGL's drawing buffer (see `finish`).
+        let verts = tw_clip(&d.xf, (2.0 / (2.0 * hw)) as f32, (2.0 / (2.0 * hh)) as f32, 0.0, 0.0, true);
+        Some(Quad { tex, u, nearest: d.draw_nearest(scale), verts, viewport: self.full_viewport() })
     }
 
     // ------------------------------------------------------------- frame
@@ -468,7 +529,7 @@ impl Gpu {
 
     /// Composite the pen layer at this point of the frame.
     pub fn pen_layer(&mut self) {
-        self.items.push(Item::Rect(self.pen.clone(), [-1.0, 1.0, 1.0, -1.0]));
+        self.items.push(Item::Rect(self.pen.clone(), [-1.0, -1.0, 1.0, 1.0]));
     }
 
     /// A screen-aligned raster at device pixel `(x, y)`; `slot` identifies
@@ -483,7 +544,8 @@ impl Gpu {
         self.overlays.insert(slot, tex.clone());
         let (w, h) = (self.width as f32, self.height as f32);
         let ndc_x = |px: f32| px / w * 2.0 - 1.0;
-        let ndc_y = |py: f32| 1.0 - py / h * 2.0;
+        // The target is bottom up: device row 0 is NDC y = -1.
+        let ndc_y = |py: f32| py / h * 2.0 - 1.0;
         let rect = [ndc_x(x as f32), ndc_y(y as f32), ndc_x((x + r.w as i64) as f32), ndc_y((y + r.h as i64) as f32)];
         self.items.push(Item::Rect(tex, rect));
     }
@@ -495,6 +557,14 @@ impl Gpu {
         let Some(cmd) = self.queue.commandBuffer() else { return };
         let _keep = self.encode_frame(&cmd);
         self.read_into(&cmd, &self.target, out);
+        // The target holds the stage bottom up (WebGL's drawing buffer as
+        // ANGLE stores it, which decides edge rules and texel choice).
+        let row = self.width * 4;
+        let n = (out.len() / row).min(self.height);
+        for y in 0..n / 2 {
+            let (top, bottom) = out.split_at_mut((n - 1 - y) * row);
+            top[y * row..(y + 1) * row].swap_with_slice(&mut bottom[..row]);
+        }
     }
 
     /// Present the frame in the attached layer (`attach_view`) without
@@ -508,7 +578,8 @@ impl Gpu {
             let desc = pass(&drawable.texture(), Some([1.0; 4]));
             if let Some(enc) = cmd.renderCommandEncoderWithDescriptor(&desc) {
                 enc.setRenderPipelineState(&blit);
-                let rect = [-1.0f32, 1.0, 1.0, -1.0];
+                // The target is bottom up.
+                let rect = [-1.0f32, -1.0, 1.0, 1.0];
                 // SAFETY: `rect` is the shader's `Rect` (one float4).
                 unsafe {
                     enc.setVertexBytes_length_atIndex(NonNull::from(&rect).cast::<c_void>(), 16, 0);
@@ -587,14 +658,22 @@ impl Gpu {
         enc.setRenderPipelineState(&self.sprite);
         let u = NonNull::from(&q.u).cast::<c_void>();
         let len = std::mem::size_of::<SpriteUniforms>();
-        // SAFETY: `u` points at `len` bytes of uniforms laid out as the shader's `Sprite`.
+        // SAFETY: `u` points at `len` bytes of uniforms laid out as the shader's `Sprite`;
+        // the vertices are six float4s.
         unsafe {
             enc.setVertexBytes_length_atIndex(u, len, 0);
             enc.setFragmentBytes_length_atIndex(u, len, 0);
             enc.setFragmentTexture_atIndex(Some(&q.tex), 0);
             enc.setFragmentSamplerState_atIndex(Some(if q.nearest { &self.nearest } else { &self.linear }), 0);
-            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
+            enc.setVertexBytes_length_atIndex(NonNull::from(&q.verts).cast::<c_void>(), std::mem::size_of_val(&q.verts), 1);
+            enc.setViewport(q.viewport);
+            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 6);
+            enc.setViewport(self.full_viewport());
         }
+    }
+
+    fn full_viewport(&self) -> MTLViewport {
+        MTLViewport { originX: 0.0, originY: 0.0, width: self.width as f64, height: self.height as f64, znear: 0.0, zfar: 1.0 }
     }
 
     fn draw_rect(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, tex: &Tex, rect: &[f32; 4]) {
@@ -644,9 +723,11 @@ impl Gpu {
         self.pen_copy = Some(Raster::new(self.width, self.height));
     }
 
-    /// A line between device-pixel points with the given width and straight RGBA colour.
-    pub fn pen_line(&mut self, a: (f32, f32), b: (f32, f32), width: f32, rgba: [f32; 4]) {
-        let line = LineInstance { p: [a.0, a.1, b.0, b.1], color: rgba, misc: [width / 2.0, self.width as f32, self.height as f32, 0.0] };
+    /// A line with `PenSkin._drawLineOnBuffer`'s attributes: premultiplied
+    /// colour, thickness and length, and the pen points `(x0, -y0, dx, -dy)`
+    /// in device pixels from the stage centre.
+    pub fn pen_line(&mut self, color: [f32; 4], thickness: f32, length: f32, pts: [f32; 4]) {
+        let line = LineInstance { color, tl: [thickness, length, self.width as f32, self.height as f32], pts };
         match self.pen_ops.last_mut() {
             Some(PenOp::Lines(lines)) => lines.push(line),
             _ => self.pen_ops.push(PenOp::Lines(vec![line])),
@@ -654,8 +735,10 @@ impl Gpu {
         self.pen_copy = None;
     }
 
-    pub fn pen_stamp(&mut self, skin: &mut Skin, d: &Draw, scale: f64) {
-        if let Some(q) = self.quad(skin, d, scale) {
+    pub fn pen_stamp(&mut self, skin: &mut Skin, d: &Draw, scale: f64, bounds: (f64, f64, f64, f64)) {
+        if let Some(mut q) = self.quad(skin, d, scale) {
+            let Some((verts, viewport)) = tw_stamp_vertices(d, scale, bounds) else { return };
+            (q.verts, q.viewport) = (verts, viewport);
             self.pen_ops.push(PenOp::Stamp(q));
             self.pen_copy = None;
         }

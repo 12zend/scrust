@@ -119,7 +119,7 @@ fn receive_script(me: TargetRef) -> BoxFut {
 }
 
 fn script(kind: HatKind, restart: bool, start: fn(TargetRef) -> BoxFut) -> ScriptDef {
-    ScriptDef { kind, field: "", msg: 0, restart, start, pred: None }
+    ScriptDef { kind, field: "", msg: 0, restart, start, pred: None, creates: &[] }
 }
 
 fn sprite(name: &'static str, is_stage: bool, scripts: Vec<ScriptDef>, new_locals: fn() -> Box<dyn Locals>) -> SpriteDef {
@@ -139,6 +139,9 @@ fn sprite(name: &'static str, is_stage: bool, scripts: Vec<ScriptDef>, new_local
         costume: 0,
         rotation_style: RotationStyle::AllAround,
         volume: 100.0,
+        declared_vars: usize::MAX,
+        declared_lists: usize::MAX,
+        tempo: 60.0,
     }
 }
 

@@ -4,7 +4,7 @@
 //! compositor with `SoftRenderer`.
 
 use crate::skin::{Raster, Skin};
-use crate::{composite, fence, text, tight_bounds, touching_skin, Draw, Effects, Gpu};
+use crate::{composite, fence, text, tight_bounds, touching_raster, Draw, Effects, Gpu};
 use resvg::usvg;
 use scrust_runtime::{Bounds, STAGE_HEIGHT, STAGE_WIDTH};
 use std::collections::HashMap;
@@ -207,7 +207,7 @@ impl Scene {
                 return false;
             }
             match self.draw_of(*id) {
-                Some((d, skin)) => touching_skin(&self.skins[&skin], &d, x, y),
+                Some((d, skin)) => touching_raster(self.skins[&skin].sil_raster(), &d, x, y),
                 None => false,
             }
         })

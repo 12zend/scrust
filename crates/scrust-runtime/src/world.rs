@@ -7,9 +7,26 @@ use std::any::Any;
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// Default stage size; a project's TurboWarp config may change it
+/// (`stage_width()` / `stage_height()`).
 pub const STAGE_WIDTH: f64 = 480.0;
 pub const STAGE_HEIGHT: f64 = 360.0;
-pub const MAX_CLONES: usize = 300;
+
+static STAGE_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new((480u64 << 32) | 360);
+
+/// The running program's stage size (TurboWarp's `runtime.stageWidth`).
+#[inline]
+pub fn stage_width() -> f64 {
+    (STAGE_SIZE.load(std::sync::atomic::Ordering::Relaxed) >> 32) as f64
+}
+#[inline]
+pub fn stage_height() -> f64 {
+    (STAGE_SIZE.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF_FFFF) as f64
+}
+pub fn set_stage_size(width: f64, height: f64) {
+    let (w, h) = (width.round().clamp(1.0, 16384.0) as u64, height.round().clamp(1.0, 16384.0) as u64);
+    STAGE_SIZE.store((w << 32) | h, std::sync::atomic::Ordering::Relaxed);
+}
 
 thread_local! {
     static WORLD: Cell<*mut World> = const { Cell::new(std::ptr::null_mut()) };
@@ -217,6 +234,9 @@ pub struct ScriptDef {
     pub start: fn(TargetRef) -> BoxFut,
     /// Predicate of edge-activated hats.
     pub pred: Option<fn(&mut World, TargetRef) -> bool>,
+    /// Undeclared variables (`false`) and lists (`true`) by index that
+    /// TurboWarp creates when it compiles this script (its first start).
+    pub creates: &'static [(bool, u16)],
 }
 
 pub struct SpriteDef {
@@ -235,6 +255,12 @@ pub struct SpriteDef {
     pub costume: usize,
     pub rotation_style: RotationStyle,
     pub volume: f64,
+    /// Variables / lists declared in the project; the rest are created on
+    /// demand (see `ScriptDef::creates`).
+    pub declared_vars: usize,
+    pub declared_lists: usize,
+    /// Music extension tempo (stage only).
+    pub tempo: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -358,6 +384,10 @@ pub trait Renderer {
     fn pen_clear(&mut self);
     fn pen_line(&mut self, pen: &PenState, x0: f64, y0: f64, x1: f64, y1: f64);
     fn pen_stamp(&mut self, w: &World, t: TargetRef);
+    /// End of a frame: scratch-render draws the stage, which creates the MIPs
+    /// (and so the silhouettes) visible drawables are drawn with, whether or
+    /// not the frame is shown.
+    fn frame_drawn(&mut self, _w: &World) {}
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -384,11 +414,34 @@ pub struct Options {
     pub warp_timer: bool,
     /// Scripted answers for `ask and wait` (headless runs).
     pub answers: Vec<String>,
+    /// TurboWarp runtime options (project config comment).
+    pub fencing: bool,
+    pub misc_limits: bool,
+    pub max_clones: f64,
+    /// High quality pen (no pen size clamp).
+    pub hq: bool,
+    /// Stage size (TurboWarp config `width` / `height`).
+    pub stage_width: f64,
+    pub stage_height: f64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { turbo: false, deterministic: false, max_passes: None, seed: 1, fps: 30.0, warp_timer: false, answers: Vec::new() }
+        Options {
+            turbo: false,
+            deterministic: false,
+            max_passes: None,
+            seed: 1,
+            fps: 30.0,
+            warp_timer: false,
+            answers: Vec::new(),
+            fencing: true,
+            misc_limits: true,
+            max_clones: 300.0,
+            hq: false,
+            stage_width: 480.0,
+            stage_height: 360.0,
+        }
     }
 }
 
@@ -457,6 +510,10 @@ pub struct World {
     pub renderer: Option<Box<dyn Renderer>>,
     pub audio: Option<Box<dyn Audio>>,
     pub monitor_visible: Vec<bool>,
+    /// Per sprite: undeclared variables / lists created so far, in order.
+    pub created: Vec<Vec<(bool, u16)>>,
+    /// Music extension tempo (beats per minute), from the stage.
+    pub tempo: f64,
     pub username: JsStr,
     bubble_uid: u64,
     answers_used: usize,
@@ -467,6 +524,7 @@ pub const DETERMINISTIC_EPOCH_MS: f64 = 1577836800000.0;
 
 impl World {
     pub fn new(program: &'static ProgramDef, options: Options) -> Box<World> {
+        set_stage_size(options.stage_width, options.stage_height);
         let step_time = 1000.0 / options.fps;
         let mut w = Box::new(World {
             program,
@@ -495,6 +553,8 @@ impl World {
             renderer: None,
             audio: None,
             monitor_visible: program.monitors.iter().map(|m| m.visible).collect(),
+            created: vec![Vec::new(); program.sprites.len()],
+            tempo: program.sprites.first().map(|s| s.tempo).unwrap_or(60.0),
             username: JsStr::empty(),
             bubble_uid: 0,
             answers_used: 0,
@@ -667,7 +727,8 @@ impl World {
     pub fn create_clone(&mut self, me: TargetRef, option: JsStr) {
         let source = if option.eq_str("_myself_") { Some(me) } else { self.sprite_by_name(&option) };
         let Some(src) = source else { return };
-        if self.clone_count >= MAX_CLONES || self.target(src).is_stage {
+        // `clonesAvailable`: `_cloneCounter < runtimeOptions.maxClones`.
+        if !((self.clone_count as f64) < self.options.max_clones) || self.target(src).is_stage {
             return;
         }
         self.clone_count += 1;

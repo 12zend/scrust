@@ -173,6 +173,9 @@ pub enum Stmt {
     Ask(Expr),
     PlaySoundUntilDone(Expr),
     SwitchBackdropAndWait(Expr),
+    /// Music extension: play a note (`kind` 0) or drum (1) for some beats, or
+    /// rest (2). `arg` is the note / drum input (evaluated, not played).
+    MusicWait { kind: u8, arg: Expr, beats: Expr },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -289,6 +292,7 @@ impl Stmt {
             Stmt::Glide { secs, x, y } => vec![secs, x, y],
             Stmt::GlideTo { secs, to } => vec![secs, to],
             Stmt::SayForSecs { message, secs, .. } => vec![message, secs],
+            Stmt::MusicWait { arg, beats, .. } => vec![arg, beats],
             _ => vec![],
         }
     }

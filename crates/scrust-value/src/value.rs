@@ -268,6 +268,17 @@ pub fn is_whitespace(v: &Value) -> bool {
     }
 }
 
+/// TurboWarp's `isNotActuallyZero` (cast.js): a string with no digit and no
+/// tab. For a string whose `Number()` is 0 that means whitespace without a
+/// tab (TurboWarp counts `"\t"` as 0, following scratch-www's `trim`).
+#[inline]
+pub fn is_not_actually_zero(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => s.is_not_actually_zero(),
+        _ => false,
+    }
+}
+
 fn ord_to_f64(o: Ordering) -> f64 {
     match o {
         Ordering::Less => -1.0,
@@ -285,9 +296,9 @@ pub fn compare(a: &Value, b: &Value) -> f64 {
     }
     let mut n1 = a.js_number();
     let mut n2 = b.js_number();
-    if n1 == 0.0 && is_whitespace(a) {
+    if n1 == 0.0 && is_not_actually_zero(a) {
         n1 = f64::NAN;
-    } else if n2 == 0.0 && is_whitespace(b) {
+    } else if n2 == 0.0 && is_not_actually_zero(b) {
         n2 = f64::NAN;
     }
     if n1.is_nan() || n2.is_nan() {

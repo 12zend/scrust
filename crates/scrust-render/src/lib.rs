@@ -9,6 +9,7 @@ pub mod frames;
 #[cfg(target_os = "macos")]
 mod gpu;
 pub mod scene;
+mod color;
 mod skin;
 mod text;
 
@@ -45,10 +46,10 @@ mod gpu {
         pub fn pen_clear(&mut self) {
             match *self {}
         }
-        pub fn pen_line(&mut self, _a: (f32, f32), _b: (f32, f32), _width: f32, _rgba: [f32; 4]) {
+        pub fn pen_line(&mut self, _color: [f32; 4], _thickness: f32, _length: f32, _pts: [f32; 4]) {
             match *self {}
         }
-        pub fn pen_stamp(&mut self, _skin: &mut Skin, _d: &Draw, _scale: f64) {
+        pub fn pen_stamp(&mut self, _skin: &mut Skin, _d: &Draw, _scale: f64, _bounds: (f64, f64, f64, f64)) {
             match *self {}
         }
         pub fn pen_pixels(&mut self) -> &Raster {
@@ -75,7 +76,7 @@ pub use scene::Scene;
 
 use resvg::tiny_skia;
 use resvg::usvg;
-use scrust_runtime::{Bounds, PenState, ProgramDef, Renderer, RotationStyle, Target, TargetRef, World, STAGE_HEIGHT, STAGE_WIDTH};
+use scrust_runtime::{Bounds, PenState, ProgramDef, Renderer, RotationStyle, Target, TargetRef, World, stage_height, stage_width};
 use skin::{Raster, Skin};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,7 +107,7 @@ impl Xf {
     /// `Drawable._calculateTransform`.
     fn new(pos: (f64, f64), direction: f64, scale: (f64, f64), size: (f64, f64), center: (f64, f64)) -> Xf {
         let rot = (270.0 - direction) * PI / 180.0;
-        let (c, s) = (f32r(libm::cos(rot)), f32r(libm::sin(rot)));
+        let (c, s) = (f32r(scrust_value::jsmath::cos(rot)), f32r(scrust_value::jsmath::sin(rot)));
         let ns = f32r(-s);
         let (scale0, scale1) = (f32r(scale.0), f32r(scale.1));
         let adj0 = f32r((center.0 - size.0 / 2.0) * scale0 / 100.0);
@@ -260,6 +261,111 @@ impl Effects {
     }
 }
 
+/// Store into a `Uint8ClampedArray` element: NaN is 0, clamp to 0..255,
+/// round half to even.
+#[inline]
+fn u8c(x: f64) -> f64 {
+    if !(x > 0.0) {
+        return 0.0;
+    }
+    if x >= 255.0 {
+        return 255.0;
+    }
+    let f = x.floor();
+    let d = x - f;
+    if d > 0.5 || (d == 0.5 && f % 2.0 != 0.0) {
+        f + 1.0
+    } else {
+        f
+    }
+}
+
+impl Effects {
+    /// `EffectTransform.transformColor` as scratch-render runs it on the CPU
+    /// for `touching color`: every write goes through a `Uint8ClampedArray`.
+    fn color_touch(&self, c: [f64; 4], with_ghost: bool) -> [f64; 4] {
+        let mut c = c;
+        if c[3] == 0.0 {
+            return c;
+        }
+        let enable_color = self.color != 0.0;
+        let enable_brightness = self.brightness != 0.0;
+        if enable_color || enable_brightness {
+            let alpha = c[3] / 255.0;
+            for v in c.iter_mut().take(3) {
+                *v = u8c(*v / alpha);
+            }
+            if enable_color {
+                // color-conversions.js rgbToHsv
+                let (mut r, mut g, mut b) = (c[0] / 255.0, c[1] / 255.0, c[2] / 255.0);
+                let mut k = 0.0;
+                if g < b {
+                    std::mem::swap(&mut g, &mut b);
+                    k = -1.0;
+                }
+                if r < g {
+                    std::mem::swap(&mut r, &mut g);
+                    k = -2.0 / 6.0 - k;
+                }
+                let chroma = r - g.min(b);
+                let mut h = (k + (g - b) / (6.0 * chroma + f64::EPSILON)).abs();
+                let mut s = chroma / (r + f64::EPSILON);
+                let mut v = r;
+                const MIN_V: f64 = 0.11 / 2.0;
+                const MIN_S: f64 = 0.09;
+                if v < MIN_V {
+                    h = 0.0;
+                    s = 1.0;
+                    v = MIN_V;
+                } else if s < MIN_S {
+                    h = 0.0;
+                    s = MIN_S;
+                }
+                h = (self.color / 200.0) % 1.0 + h + 1.0;
+                // hsvToRgb: writes `x * 255 + 0.5`
+                let rgb = if s == 0.0 {
+                    (v, v, v)
+                } else {
+                    h %= 1.0;
+                    let i = (h * 6.0) as i32;
+                    let f = h * 6.0 - i as f64;
+                    let p = v * (1.0 - s);
+                    let q = v * (1.0 - s * f);
+                    let t = v * (1.0 - s * (1.0 - f));
+                    match i {
+                        0 => (v, t, p),
+                        1 => (q, v, p),
+                        2 => (p, v, t),
+                        3 => (p, q, v),
+                        4 => (t, p, v),
+                        5 => (v, p, q),
+                        _ => (0.0, 0.0, 0.0),
+                    }
+                };
+                c[0] = u8c(rgb.0 * 255.0 + 0.5);
+                c[1] = u8c(rgb.1 * 255.0 + 0.5);
+                c[2] = u8c(rgb.2 * 255.0 + 0.5);
+            }
+            if enable_brightness {
+                let b = self.brightness.clamp(-100.0, 100.0) / 100.0 * 255.0;
+                for v in c.iter_mut().take(3) {
+                    *v = u8c(*v + b);
+                }
+            }
+            for v in c.iter_mut().take(3) {
+                *v = u8c(*v * alpha);
+            }
+        }
+        if with_ghost && self.ghost != 0.0 {
+            let g = 1.0 - self.ghost.clamp(0.0, 100.0) / 100.0;
+            for v in c.iter_mut() {
+                *v = u8c(*v * g);
+            }
+        }
+        c
+    }
+}
+
 fn rgb_to_hsv(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
@@ -346,16 +452,39 @@ struct Draw {
     size: (f64, f64),
     /// `Skin.useNearest`: nearest-neighbour silhouette test, else the 2x2 "linear" test.
     nearest: bool,
+    /// The drawable's position (rounded unless high quality).
+    pos: (f64, f64),
+    /// SVG skin that may be sampled nearest at ~100% (no distortion, upright).
+    svg_nearest_ok: bool,
+    is_svg: bool,
+    /// Drawable scale in percent (`drawable.scale`).
+    pct: (f64, f64),
 }
 
 impl Draw {
+    /// Nothing to draw: an empty skin, or a transform that is not finite
+    /// (a zero-sized skin at an infinite size gives NaN), which WebGL
+    /// rasterises as nothing.
+    fn degenerate(&self) -> bool {
+        let x = &self.xf;
+        self.size.0 <= 0.0 || self.size.1 <= 0.0 || ![x.m00, x.m01, x.m10, x.m11, x.tx, x.ty].iter().all(|v| v.is_finite())
+    }
+
     /// Transform and sampling mode for a skin drawn at `pos` with a Scratch
     /// direction and percentage scale (`RenderedTarget` -> `Drawable`).
     fn new(skin: &Skin, pos: (f64, f64), direction: f64, scale: (f64, f64), fx: Effects, sprite: usize, costume: usize) -> Draw {
-        let is_svg = matches!(skin.kind, skin::SkinKind::Svg(_));
+        let is_svg = matches!(skin.kind, skin::SkinKind::Svg(..));
         let near100 = |v: f64| v.abs() > 99.0 && v.abs() < 101.0;
-        let nearest = !is_svg || (!fx.distorts() && direction % 90.0 == 0.0 && near100(scale.0) && near100(scale.1));
-        Draw { xf: Xf::new(pos, direction, scale, skin.size, skin.center), fx, sprite, costume, size: skin.size, nearest }
+        let svg_nearest_ok = !fx.distorts() && direction % 90.0 == 0.0;
+        let nearest = !is_svg || (svg_nearest_ok && near100(scale.0) && near100(scale.1));
+        Draw { xf: Xf::new(pos, direction, scale, skin.size, skin.center), fx, sprite, costume, size: skin.size, nearest, pos, svg_nearest_ok, is_svg, pct: scale }
+    }
+
+    /// `skin.useNearest(drawableScale)` when drawing at `k` device pixels per
+    /// stage unit: bitmaps always use NEAREST, SVGs only at about 100%.
+    fn draw_nearest(&self, k: f64) -> bool {
+        let near100 = |v: f64| v.abs() > 99.0 && v.abs() < 101.0;
+        !self.is_svg || (self.svg_nearest_ok && near100(self.pct.0 * k) && near100(self.pct.1 * k))
     }
 }
 
@@ -378,14 +507,22 @@ fn silhouette_touching(base: &Raster, u: f64, v: f64, nearest: bool) -> bool {
 }
 
 /// Is the drawable opaque at world point `(x, y)`? (`Drawable.isTouching`)
-fn touching_skin(skin: &Skin, d: &Draw, x: f64, y: f64) -> bool {
+fn touching_skin(skin: &mut Skin, d: &Draw, x: f64, y: f64) -> bool {
+    touching_raster(skin.silhouette(d.pct), d, x, y)
+}
+
+/// `Drawable.isTouching` against a given silhouette raster.
+fn touching_raster(sil: &Raster, d: &Draw, x: f64, y: f64) -> bool {
+    if d.degenerate() {
+        return false;
+    }
     let (mut u, mut v) = d.xf.to_uv(x, y);
     if d.fx.distorts() && (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
         let p = d.fx.point(u, v, d.size);
         u = p.0;
         v = p.1;
     }
-    silhouette_touching(&skin.base, u, v, d.nearest)
+    silhouette_touching(sil, u, v, d.nearest)
 }
 
 /// Tight bounds (`Drawable.getBounds`): the convex hull scratch-render
@@ -396,12 +533,14 @@ fn tight_bounds(skin: &mut Skin, d: &Draw) -> Bounds {
     let (w, h) = d.size;
     let fx = d.fx;
     let distort = fx.distorts();
+    skin.silhouette(d.pct);
     if !distort && skin.hull.is_none() {
-        skin.hull = Some(hull_rows(&skin.base, (w, h), None));
+        let rows = hull_rows(skin.sil_raster(), (w, h), None);
+        skin.hull = Some(rows);
     }
     let computed;
     let rows: &Vec<(f64, f64, f64)> = if distort {
-        computed = hull_rows(&skin.base, (w, h), Some(fx));
+        computed = hull_rows(skin.sil_raster(), (w, h), Some(fx));
         &computed
     } else {
         skin.hull.as_ref().expect("hull cached")
@@ -433,13 +572,13 @@ fn fence(d: &Draw, cur: (f64, f64), x: f64, y: f64) -> (f64, f64) {
     let dy = y - cur.1;
     let aabb = d.xf.aabb();
     let inset = ((aabb.right - aabb.left).min(aabb.top - aabb.bottom) / 2.0).floor();
-    let sx = STAGE_WIDTH / 2.0 - FENCE_WIDTH.min(inset);
+    let sx = stage_width() / 2.0 - FENCE_WIDTH.min(inset);
     if aabb.right + dx < -sx {
         x = (cur.0 - (sx + aabb.right)).ceil();
     } else if aabb.left + dx > sx {
         x = (cur.0 + (sx - aabb.left)).floor();
     }
-    let sy = STAGE_HEIGHT / 2.0 - FENCE_WIDTH.min(inset);
+    let sy = stage_height() / 2.0 - FENCE_WIDTH.min(inset);
     if aabb.top + dy < -sy {
         y = (cur.1 - (sy + aabb.top)).ceil();
     } else if aabb.bottom + dy > sy {
@@ -457,11 +596,14 @@ fn blend(dst: &mut [u8], src: [u8; 4]) {
 
 /// Composite one drawable into `target` (device pixels).
 fn composite(skin: &mut Skin, d: &Draw, s: f64, target: &mut Raster) {
+    if d.degenerate() {
+        return;
+    }
     let b = d.xf.aabb();
-    let x0 = (((b.left + STAGE_WIDTH / 2.0) * s).floor().max(0.0)) as usize;
-    let x1 = (((b.right + STAGE_WIDTH / 2.0) * s).ceil().min(target.w as f64)).max(0.0) as usize;
-    let y0 = (((STAGE_HEIGHT / 2.0 - b.top) * s).floor().max(0.0)) as usize;
-    let y1 = (((STAGE_HEIGHT / 2.0 - b.bottom) * s).ceil().min(target.h as f64)).max(0.0) as usize;
+    let x0 = (((b.left + stage_width() / 2.0) * s).floor().max(0.0)) as usize;
+    let x1 = (((b.right + stage_width() / 2.0) * s).ceil().min(target.w as f64)).max(0.0) as usize;
+    let y0 = (((stage_height() / 2.0 - b.top) * s).floor().max(0.0)) as usize;
+    let y1 = (((stage_height() / 2.0 - b.bottom) * s).ceil().min(target.h as f64)).max(0.0) as usize;
     if x1 <= x0 || y1 <= y0 {
         return;
     }
@@ -473,11 +615,11 @@ fn composite(skin: &mut Skin, d: &Draw, s: f64, target: &mut Raster) {
     let distort = fx.distorts();
     let recolor = fx.recolors();
     let raster = skin.raster_for(unit * s);
-    let exact = raster.w as f64 == (b.right - b.left) * s && raster.h as f64 == (b.top - b.bottom) * s;
+    let nearest = d.draw_nearest(s);
     for py in y0..y1 {
-        let wy = STAGE_HEIGHT / 2.0 - (py as f64 + 0.5) / s;
+        let wy = stage_height() / 2.0 - (py as f64 + 0.5) / s;
         for px in x0..x1 {
-            let wx = (px as f64 + 0.5) / s - STAGE_WIDTH / 2.0;
+            let wx = (px as f64 + 0.5) / s - stage_width() / 2.0;
             let (mut u, mut v) = xf.to_uv(wx, wy);
             if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                 continue;
@@ -490,7 +632,7 @@ fn composite(skin: &mut Skin, d: &Draw, s: f64, target: &mut Raster) {
                     continue;
                 }
             }
-            let mut c = if exact || distort { raster.nearest(u, v) } else { raster.linear(u, v) };
+            let mut c = if nearest { raster.nearest(u, v) } else { raster.linear(u, v) };
             if c[3] == 0 {
                 continue;
             }
@@ -537,11 +679,19 @@ pub struct SoftRenderer {
     canvas: Raster,
     /// `0x00RRGGBB` pixels ready for presentation.
     pub frame: Vec<u32>,
-    bubbles: HashMap<u32, (u64, Raster)>,
+    bubbles: HashMap<u32, (u64, bool, Raster)>,
+    /// `bubbleState.onSpriteRight` per target.
+    bubble_side: HashMap<u32, bool>,
     monitors: HashMap<usize, (String, Raster)>,
     ask: Option<(String, Raster)>,
     /// Text typed so far into the ask prompt (owned by the player).
     pub ask_input: String,
+    /// TurboWarp's high quality render (`hq`): drawables keep fractional
+    /// positions; otherwise `Drawable.updatePosition` rounds them.
+    pub high_quality: bool,
+    /// Draw monitors and the ask prompt into the frame (off for comparisons
+    /// with scratch-render's canvas, which has neither).
+    pub draw_html_overlays: bool,
     /// Metal compositor for drawing and the pen layer; None draws on the CPU.
     gpu: Option<Gpu>,
 }
@@ -592,8 +742,8 @@ impl SoftRenderer {
 
     /// A renderer that draws everything on the CPU (deterministic output).
     pub fn new_cpu(program: &'static ProgramDef, scale: f64) -> SoftRenderer {
-        let width = (STAGE_WIDTH * scale).round() as usize;
-        let height = (STAGE_HEIGHT * scale).round() as usize;
+        let width = (stage_width() * scale).round() as usize;
+        let height = (stage_height() * scale).round() as usize;
         let mut opt = usvg::Options::default();
         {
             let db = Arc::make_mut(&mut opt.fontdb);
@@ -612,10 +762,13 @@ impl SoftRenderer {
             canvas: Raster::new(width, height),
             frame: vec![0xFFFFFF; width * height],
             bubbles: HashMap::new(),
+            bubble_side: HashMap::new(),
             monitors: HashMap::new(),
             ask: None,
             ask_input: String::new(),
             gpu: None,
+            high_quality: false,
+            draw_html_overlays: true,
         }
     }
 
@@ -625,6 +778,11 @@ impl SoftRenderer {
     }
 
     /// Premultiplied pen-layer pixel at device coordinates.
+    /// Pen layer size in device pixels.
+    fn pen_size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
     fn pen_pixel(&mut self, x: u32, y: u32) -> Option<[u8; 4]> {
         if let Some(gpu) = self.gpu.as_mut() {
             let r = gpu.pen_pixels();
@@ -658,7 +816,13 @@ impl SoftRenderer {
                 RotationStyle::LeftRight => (90.0, (if t.direction < 0.0 { -t.size } else { t.size }, t.size)),
             }
         };
-        let pos = if t.is_stage { (0.0, 0.0) } else { (t.x, t.y) };
+        let pos = if t.is_stage {
+            (0.0, 0.0)
+        } else if self.high_quality {
+            (t.x, t.y)
+        } else {
+            (scrust_value::js_round(t.x), scrust_value::js_round(t.y))
+        };
         let fx = Effects::of(t);
         let skin = self.skin(t.sprite, costume);
         Some(Draw::new(skin, pos, direction, scale, fx, t.sprite, costume))
@@ -670,28 +834,27 @@ impl SoftRenderer {
     }
 
     /// Colour of the drawable at a world point (`Drawable.sampleColor4b`).
-    fn sample(&mut self, d: &Draw, x: f64, y: f64, with_ghost: bool) -> [u8; 4] {
-        let (mut u, mut v) = d.xf.to_uv(x, y);
+    /// `Drawable.sampleColor4b`: nearest silhouette texel at the local
+    /// position (shape-changing effects are not applied), then
+    /// `EffectTransform.transformColor`.
+    fn sample(&mut self, d: &Draw, x: f64, y: f64, with_ghost: bool) -> [f64; 4] {
+        let (u, v) = d.xf.to_uv(x, y);
         if u < 0.0 || v < 0.0 || u > 1.0 || v > 1.0 {
-            return [0; 4];
+            return [0.0; 4];
         }
-        if d.fx.distorts() && u < 1.0 && v < 1.0 {
-            let p = d.fx.point(u, v, d.size);
-            u = p.0;
-            v = p.1;
+        // `Silhouette.colorAtNearest` (clamped to the edge)
+        let base = self.skin(d.sprite, d.costume).silhouette(d.pct);
+        if base.w == 0 || base.h == 0 {
+            return [0.0; 4];
         }
-        // `Silhouette.colorAtNearest`
-        let base = &self.skin(d.sprite, d.costume).base;
-        let sx = (u * (base.w as f64 - 1.0)).floor();
-        let sy = (v * (base.h as f64 - 1.0)).floor();
-        if sx < 0.0 || sy < 0.0 || sx >= base.w as f64 || sy >= base.h as f64 {
-            return [0; 4];
-        }
-        let px = base.px(sx as usize, sy as usize);
+        let sx = ((u * (base.w as f64 - 1.0)).floor().max(0.0) as usize).min(base.w - 1);
+        let sy = ((v * (base.h as f64 - 1.0)).floor().max(0.0) as usize).min(base.h - 1);
+        let px = base.px(sx, sy);
+        let c = [px[0] as f64, px[1] as f64, px[2] as f64, px[3] as f64];
         if d.fx.recolors() {
-            d.fx.color(px, with_ghost)
+            d.fx.color_touch(c, with_ghost)
         } else {
-            px
+            c
         }
     }
 
@@ -707,9 +870,16 @@ impl SoftRenderer {
     /// float noise of `sin(180 deg)` in the transform pushes exact integer
     /// edges just past the integer, so snapping grows the box by one pixel -
     /// that is why sprites one pixel apart still "touch" in Scratch.
-    fn scan_bounds(&mut self, d: &Draw) -> Option<(i64, i64, i64, i64)> {
+    ///
+    /// With TurboWarp's fencing off (`offscreenTouching`) the region is not
+    /// clamped to the stage.
+    fn scan_bounds(&mut self, d: &Draw, offscreen: bool) -> Option<(i64, i64, i64, i64)> {
         let b = d.xf.aabb();
-        let (xl, xr, yb, yt) = (-STAGE_WIDTH / 2.0, STAGE_WIDTH / 2.0, -STAGE_HEIGHT / 2.0, STAGE_HEIGHT / 2.0);
+        let (xl, xr, yb, yt) = if offscreen {
+            (f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY)
+        } else {
+            (-stage_width() / 2.0, stage_width() / 2.0, -stage_height() / 2.0, stage_height() / 2.0)
+        };
         // Rectangle.clamp
         let left = b.left.max(xl).min(xr);
         let right = b.right.min(xr).max(xl);
@@ -859,8 +1029,11 @@ impl SoftRenderer {
 
     fn draw_overlays(&mut self, w: &World, out: &mut Overlays) {
         self.draw_bubbles(w, out);
-        self.draw_monitors(w, out);
-        self.draw_ask(w, out);
+        // Monitors and the ask prompt are HTML over the stage in the GUI.
+        if self.draw_html_overlays {
+            self.draw_monitors(w, out);
+            self.draw_ask(w, out);
+        }
     }
 
     /// Copy a composed RGBA canvas into `self.frame`.
@@ -870,6 +1043,10 @@ impl SoftRenderer {
         }
     }
 
+    /// Speech bubbles, placed like scratch-vm's `_positionBubble`: to the
+    /// right of the top 8 px slice of the sprite, flipped to its left when
+    /// it would not fit (the side is remembered), kept on stage; the
+    /// bubble drawable's position is rounded like any drawable's.
     fn draw_bubbles(&mut self, w: &World, out: &mut Overlays) {
         let s = self.scale;
         let mut live: Vec<u32> = Vec::new();
@@ -880,29 +1057,59 @@ impl SoftRenderer {
                 continue;
             }
             live.push(t.idx);
-            let fresh = !matches!(self.bubbles.get(&t.idx), Some((u, _)) if *u == b.usage);
-            if fresh {
-                let r = text::bubble(&b.text.to_rust_string(), b.think, s, &self.opt);
-                self.bubbles.insert(t.idx, (b.usage, r));
-            }
-            let Some(d) = self.draw_info(tg) else { continue };
-            let bounds = self.tight_bounds(&d);
-            let (bw, bh) = {
-                let r = &self.bubbles[&t.idx].1;
-                (r.w as f64 / s, r.h as f64 / s)
+            let text = b.text.to_rust_string();
+            let (_, pw, ph) = text::bubble_layout(&text, &self.opt);
+            let (bw, bh) = (pw + 4.0, ph + 4.0 + 12.0);
+            let tb = match self.draw_info(tg) {
+                Some(d) => self.bubble_bounds(&d),
+                None => Bounds { left: tg.x, right: tg.x, top: tg.y, bottom: tg.y },
             };
-            // Up and to the right of the sprite, kept on stage.
-            let mut left = bounds.right - 10.0;
-            if left + bw > STAGE_WIDTH / 2.0 {
-                left = (bounds.left - bw + 10.0).max(-STAGE_WIDTH / 2.0);
+            let (sl, sr, st) = (-stage_width() / 2.0, stage_width() / 2.0, stage_height() / 2.0);
+            let right = self.bubble_side.entry(t.idx).or_insert(true);
+            if *right && bw + tb.right > sr && tb.left - bw > sl {
+                *right = false;
+            } else if !*right && tb.left - bw < sl && bw + tb.right < sr {
+                *right = true;
             }
-            let top = (bounds.top + bh - 8.0).min(STAGE_HEIGHT / 2.0).max(-STAGE_HEIGHT / 2.0 + bh);
-            let x = ((left + STAGE_WIDTH / 2.0) * s).round() as i64;
-            let y = ((STAGE_HEIGHT / 2.0 - top) * s).round() as i64;
-            let r = &self.bubbles[&t.idx].1;
-            out.put(SLOT_BUBBLE | t.idx as u64, r, x, y);
+            let on_right = *right;
+            let x = if on_right { sl.max((sr - bw).min(tb.right)) } else { (sr - bw).min(sl.max(tb.left - bw)) };
+            let y = st.min(tb.top + bh);
+            let (x, y) = if self.high_quality { (x, y) } else { (scrust_value::js_round(x), scrust_value::js_round(y)) };
+            let fresh = !matches!(self.bubbles.get(&t.idx), Some((u, side, _)) if *u == b.usage && *side == on_right);
+            if fresh {
+                let r = text::bubble(&text, b.think, !on_right, s, &self.opt);
+                self.bubbles.insert(t.idx, (b.usage, on_right, r));
+            }
+            let px = ((x + stage_width() / 2.0) * s).round() as i64;
+            let py = ((stage_height() / 2.0 - y) * s).round() as i64;
+            let r = &self.bubbles[&t.idx].2;
+            out.put(SLOT_BUBBLE | t.idx as u64, r, px, py);
         }
         self.bubbles.retain(|k, _| live.contains(k));
+        self.bubble_side.retain(|k, _| w.targets.get(*k as usize).is_some());
+    }
+
+    /// `Drawable.getBoundsForBubble`: bounds of the hull points within 8
+    /// units of the top.
+    fn bubble_bounds(&mut self, d: &Draw) -> Bounds {
+        let skin = self.skin(d.sprite, d.costume);
+        skin.silhouette(d.pct);
+        let rows = hull_rows(skin.sil_raster(), d.size, if d.fx.distorts() { Some(d.fx) } else { None });
+        let (w, h) = d.size;
+        let (hx, hy) = (1.0 / w / 2.0, 1.0 / h / 2.0);
+        let pts: Vec<(f64, f64)> = rows.iter().flat_map(|&(y, x0, x1)| [(x0, y), (x1, y)]).map(|(x, y)| d.xf.to_world(x / w + hx, y / h + hy)).collect();
+        if pts.is_empty() {
+            return d.xf.aabb();
+        }
+        let max_y = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        let mut b = Bounds { left: f64::INFINITY, right: f64::NEG_INFINITY, top: f64::NEG_INFINITY, bottom: f64::INFINITY };
+        for &(x, y) in pts.iter().filter(|p| p.1 > max_y - 8.0) {
+            b.left = b.left.min(x);
+            b.right = b.right.max(x);
+            b.top = b.top.max(y);
+            b.bottom = b.bottom.min(y);
+        }
+        b
     }
 
     fn monitor_value(&self, w: &World, i: usize) -> Option<text::MonitorValue> {
@@ -984,7 +1191,13 @@ impl Renderer for SoftRenderer {
     }
 
     fn bounds(&mut self, w: &World, t: TargetRef) -> Option<Bounds> {
-        let d = self.draw_info(w.target(t))?;
+        let tg = w.target(t);
+        let d = self.draw_info(tg)?;
+        // `_getConvexHullPointsForDrawable` returns no points for a hidden
+        // drawable, and `getFastBounds` then falls back to the quad's AABB.
+        if !tg.visible {
+            return Some(d.xf.aabb());
+        }
         Some(self.tight_bounds(&d))
     }
 
@@ -992,7 +1205,8 @@ impl Renderer for SoftRenderer {
     fn fenced_position(&mut self, w: &World, t: TargetRef, x: f64, y: f64) -> (f64, f64) {
         let tg = w.target(t);
         let Some(d) = self.draw_info(tg) else { return (x, y) };
-        fence(&d, (tg.x, tg.y), x, y)
+        // `getFencedPositionOfDrawable` measures from the drawable's (rounded) position.
+        fence(&d, d.pos, x, y)
     }
 
     fn touching_point(&mut self, w: &World, t: TargetRef, x: f64, y: f64) -> bool {
@@ -1008,7 +1222,8 @@ impl Renderer for SoftRenderer {
             return false;
         }
         let Some(me) = self.draw_info(w.target(t)) else { return false };
-        let Some((l, r, b, top)) = self.scan_bounds(&me) else { return false };
+        self.skin(me.sprite, me.costume).note_drawn((100.0, 100.0), 1.0);
+        let Some((l, r, b, top)) = self.scan_bounds(&me, !w.options.fencing) else { return false };
         let mut cands: Vec<(Draw, (i64, i64, i64, i64))> = Vec::new();
         for o in others {
             if *o == t || !w.target(*o).visible {
@@ -1047,7 +1262,9 @@ impl Renderer for SoftRenderer {
     /// `RenderWebGL.isTouchingColor` (CPU path).
     fn touching_color(&mut self, w: &World, t: TargetRef, color: [u8; 3], mask: Option<[u8; 3]>) -> bool {
         let Some(me) = self.draw_info(w.target(t)) else { return false };
-        let Some((l, r, b, top)) = self.scan_bounds(&me) else { return false };
+        // `_touchingBounds` asks for the 100% texture first.
+        self.skin(me.sprite, me.costume).note_drawn((100.0, 100.0), 1.0);
+        let Some((l, r, b, top)) = self.scan_bounds(&me, !w.options.fencing) else { return false };
         // Everything else that is visible, front to back, then the pen layer and the stage.
         let mut cands: Vec<Draw> = Vec::new();
         for o in w.order.iter().skip(1).rev() {
@@ -1060,7 +1277,6 @@ impl Renderer for SoftRenderer {
         }
         let stage = self.draw_info(w.target(w.order[0]));
         let matches = |a: [u8; 3], b: [u8; 3]| (a[0] & 0xF8) == (b[0] & 0xF8) && (a[1] & 0xF8) == (b[1] & 0xF8) && (a[2] & 0xF0) == (b[2] & 0xF0);
-        let s = self.scale;
         for y in b..=top {
             for x in l..=r {
                 let (fx, fy) = (x as f64, y as f64);
@@ -1068,6 +1284,7 @@ impl Renderer for SoftRenderer {
                     Some(m) => {
                         // `maskMatches`: 6 significant bits per channel.
                         let c = self.sample(&me, fx, fy, false);
+                        let c = [c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8];
                         c[3] > 0 && (c[0] & 0xFC) == (m[0] & 0xFC) && (c[1] & 0xFC) == (m[1] & 0xFC) && (c[2] & 0xFC) == (m[2] & 0xFC)
                     }
                     None => self.touching(&me, fx, fy),
@@ -1075,37 +1292,41 @@ impl Renderer for SoftRenderer {
                 if !hit {
                     continue;
                 }
-                // `sampleColor3b`: composite the candidates over white.
-                let mut acc = [0.0f64; 3];
-                let mut blend = 1.0f64;
-                let mut layers: Vec<[u8; 4]> = Vec::with_capacity(cands.len() + 2);
+                // `RenderWebGL.sampleColor4b`: blend front to back into a
+                // `Uint8ClampedArray` (rounded at every step), white behind.
+                let mut layers: Vec<[f64; 4]> = Vec::with_capacity(cands.len() + 2);
                 for d in &cands {
                     layers.push(self.sample(d, fx, fy, true));
                 }
                 if self.pen_used {
-                    let px = (((fx + STAGE_WIDTH / 2.0) * s) as i64).clamp(0, self.width as i64 - 1) as u32;
-                    let py = (((STAGE_HEIGHT / 2.0 - fy) * s) as i64).clamp(0, self.height as i64 - 1) as u32;
-                    if let Some(p) = self.pen_pixel(px, py) {
-                        layers.push(p);
+                    // The pen drawable covers the stage; its silhouette is
+                    // sampled at floor(u * (width - 1)) like any skin.
+                    let (pw, ph) = self.pen_size();
+                    let u = (fx + stage_width() / 2.0) / stage_width();
+                    let v = (stage_height() / 2.0 - fy) / stage_height();
+                    if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) && pw > 0 && ph > 0 {
+                        let px = ((u * (pw as f64 - 1.0)).floor() as u32).min(pw as u32 - 1);
+                        let py = ((v * (ph as f64 - 1.0)).floor() as u32).min(ph as u32 - 1);
+                        if let Some(p) = self.pen_pixel(px, py) {
+                            layers.push([p[0] as f64, p[1] as f64, p[2] as f64, p[3] as f64]);
+                        }
                     }
                 }
                 if let Some(st) = &stage {
                     layers.push(self.sample(st, fx, fy, true));
                 }
+                let mut dst = [0.0f64; 3];
+                let mut blend = 1.0f64;
                 for c in layers {
-                    if blend <= 0.0 {
+                    if blend == 0.0 {
                         break;
                     }
                     for i in 0..3 {
-                        acc[i] += c[i] as f64 * blend;
+                        dst[i] = u8c(dst[i] + c[i] * blend);
                     }
-                    blend *= 1.0 - c[3] as f64 / 255.0;
+                    blend *= 1.0 - c[3] / 255.0;
                 }
-                let got = [
-                    (acc[0] + blend * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (acc[1] + blend * 255.0).round().clamp(0.0, 255.0) as u8,
-                    (acc[2] + blend * 255.0).round().clamp(0.0, 255.0) as u8,
-                ];
+                let got = [u8c(dst[0] + 255.0 * blend) as u8, u8c(dst[1] + 255.0 * blend) as u8, u8c(dst[2] + 255.0 * blend) as u8];
                 if matches(got, color) {
                     return true;
                 }
@@ -1146,12 +1367,21 @@ impl Renderer for SoftRenderer {
     fn pen_line(&mut self, pen: &PenState, x0: f64, y0: f64, x1: f64, y1: f64) {
         let s = self.scale as f32;
         let offset = if pen.diameter == 1.0 || pen.diameter == 3.0 { 0.5 } else { 0.0 };
-        let map = |x: f64, y: f64| (((x + offset + STAGE_WIDTH / 2.0) as f32) * s, ((STAGE_HEIGHT / 2.0 - (y + offset)) as f32) * s);
+        let map = |x: f64, y: f64| (((x + offset + stage_width() / 2.0) as f32) * s, ((stage_height() / 2.0 - (y + offset)) as f32) * s);
         let (ax, ay) = map(x0, y0);
         let (bx, by) = map(x1, y1);
         if let Some(gpu) = self.gpu.as_mut() {
-            let c = pen.rgba.map(|v| v.clamp(0.0, 1.0));
-            gpu.pen_line((ax, ay), (bx, by), (pen.diameter as f32 * s).max(1.0), c);
+            // `PenSkin.drawLine` / `_drawLineOnBuffer`, in float64 until the
+            // attribute buffer (Float32Array).
+            let q = self.scale;
+            let (x0, y0, x1, y1) = ((x0 + offset) * q, (y0 + offset) * q, (x1 + offset) * q, (y1 + offset) * q);
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let length = (dx * dx + dy * dy).sqrt();
+            // color4f: rgb / 255 (pen.rgba holds them as f32) and 1 - transparency / 100.
+            let a = 1.0 - pen.transparency / 100.0;
+            let ch = |v: f32| (v as f64 * 255.0).round() / 255.0;
+            let color = [(ch(pen.rgba[0]) * a) as f32, (ch(pen.rgba[1]) * a) as f32, (ch(pen.rgba[2]) * a) as f32, a as f32];
+            gpu.pen_line(color, (pen.diameter * q) as f32, length as f32, [x0 as f32, -y0 as f32, dx as f32, -dy as f32]);
             self.pen_used = true;
             return;
         }
@@ -1180,7 +1410,14 @@ impl Renderer for SoftRenderer {
         let Some(d) = self.draw_info(w.target(t)) else { return };
         if let Some(mut gpu) = self.gpu.take() {
             let s = self.scale;
-            gpu.pen_stamp(self.skin(d.sprite, d.costume), &d, s);
+            // `getFastBounds()`, clamped to the stage unless offscreen touching is on.
+            let b = d.xf.aabb();
+            let mut bounds = (b.left, b.right, b.bottom, b.top);
+            if w.options.fencing {
+                let (hw, hh) = (stage_width() / 2.0, stage_height() / 2.0);
+                bounds = (bounds.0.max(-hw).min(hw), bounds.1.min(hw).max(-hw), bounds.2.max(-hh).min(hh), bounds.3.min(hh).max(-hh));
+            }
+            gpu.pen_stamp(self.skin(d.sprite, d.costume), &d, s, bounds);
             self.gpu = Some(gpu);
             self.pen_used = true;
             return;
@@ -1189,6 +1426,22 @@ impl Renderer for SoftRenderer {
         self.draw_into(&d, &mut layer);
         self.pen.data_mut().copy_from_slice(&layer.data);
         self.pen_used = true;
+    }
+
+    fn frame_drawn(&mut self, w: &World) {
+        let s = self.scale;
+        for (i, t) in w.order.iter().enumerate() {
+            let tg = w.target(*t);
+            if i > 0 && !tg.visible {
+                continue;
+            }
+            let n = self.program.sprites[tg.sprite].costumes.len();
+            if n == 0 {
+                continue;
+            }
+            let pct = if tg.is_stage { (100.0, 100.0) } else { (tg.size, tg.size) };
+            self.skin(tg.sprite, tg.costume.min(n - 1)).note_drawn(pct, s);
+        }
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

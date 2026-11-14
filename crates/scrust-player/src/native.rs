@@ -22,6 +22,8 @@ pub fn main(program: ProgramDef, defaults: Options) {
     let mut screenshot: Option<String> = None;
     let mut embed = false;
     let mut frames_shm: Option<String> = None;
+    let mut every: u64 = 0;
+    let mut no_monitors = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -29,6 +31,8 @@ pub fn main(program: ProgramDef, defaults: Options) {
             "--screenshot" => screenshot = it.next().cloned(),
             "--embed" => embed = true,
             "--frames-shm" => frames_shm = it.next().cloned(),
+            "--screenshot-every" => every = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--no-monitors" => no_monitors = true,
             _ => {}
         }
     }
@@ -37,7 +41,7 @@ pub fn main(program: ProgramDef, defaults: Options) {
         return;
     }
     if args.trace.is_some() || screenshot.is_some() || args.frames.is_some() {
-        offscreen(program, args, scale, screenshot);
+        offscreen(program, args, scale, screenshot, every, no_monitors);
         return;
     }
     let mut world = World::new(program, args.options.clone());
@@ -52,7 +56,9 @@ pub fn main(program: ProgramDef, defaults: Options) {
 }
 
 /// Headless run with the renderer attached (`--frames`, `--trace`, `--screenshot`).
-fn offscreen(program: &'static ProgramDef, args: Args, scale: f64, screenshot: Option<String>) {
+/// With `--screenshot-every N`, every Nth frame is saved to the `--screenshot`
+/// path with `%d` replaced by the frame number.
+fn offscreen(program: &'static ProgramDef, args: Args, scale: f64, screenshot: Option<String>, every: u64, no_monitors: bool) {
     let mut world = World::new(program, args.options.clone());
     if !args.options.deterministic {
         install_native_clock(&mut world);
@@ -62,7 +68,9 @@ fn offscreen(program: &'static ProgramDef, args: Args, scale: f64, screenshot: O
     // Deterministic runs draw on the CPU so that pen pixels (and with them
     // `touching color`) do not depend on the GPU, unless Metal is asked for.
     let metal = std::env::var("SCRUST_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("metal"));
-    let renderer = if args.options.deterministic && !metal { SoftRenderer::new_cpu(program, scale) } else { SoftRenderer::new(program, scale) };
+    let mut renderer = if args.options.deterministic && !metal { SoftRenderer::new_cpu(program, scale) } else { SoftRenderer::new(program, scale) };
+    renderer.high_quality = world.options.hq;
+    renderer.draw_html_overlays = !no_monitors;
     world.renderer = Some(Box::new(renderer));
     let frames = args.trace.or(args.frames).unwrap_or(1);
     let trace = args.trace.is_some();
@@ -70,28 +78,51 @@ fn offscreen(program: &'static ProgramDef, args: Args, scale: f64, screenshot: O
         bench(&mut world, frames);
         return;
     }
+    if let (Some(path), true) = (&screenshot, every > 0) {
+        let wp: *mut World = &mut *world;
+        // SAFETY: the world is only accessed through `wp` from here on.
+        unsafe {
+            set_world_ptr(wp);
+            (*wp).green_flag();
+            for f in 1..=frames {
+                scrust_runtime::step(wp);
+                if trace && f % args.trace_every == 0 {
+                    println!("{}", (*wp).trace_line());
+                }
+                if f % every == 0 {
+                    save_screenshot(&mut *wp, &path.replace("%d", &format!("{f:06}")));
+                }
+            }
+        }
+        return;
+    }
+    let every_line = args.trace_every;
     scrust_runtime::run_headless(&mut world, frames, |w| {
-        if trace {
+        if trace && w.frame % every_line == 0 {
             println!("{}", w.trace_line());
         }
     });
     if let Some(path) = screenshot {
-        let mut r = world.renderer.take().expect("renderer");
-        if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
-            sr.draw(&world);
-            let mut rgba = Vec::with_capacity(sr.frame.len() * 4);
-            for p in &sr.frame {
-                rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
-            }
-            if let Err(e) = image::save_buffer(&path, &rgba, sr.width as u32, sr.height as u32, image::ColorType::Rgba8) {
-                eprintln!("cannot write {path}: {e}");
-            }
-        }
-        world.renderer = Some(r);
+        save_screenshot(&mut world, &path);
     }
     if args.bench {
         eprintln!("frames: {frames}");
     }
+}
+
+fn save_screenshot(world: &mut World, path: &str) {
+    let mut r = world.renderer.take().expect("renderer");
+    if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
+        sr.draw(world);
+        let mut rgba = Vec::with_capacity(sr.frame.len() * 4);
+        for p in &sr.frame {
+            rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
+        }
+        if let Err(e) = image::save_buffer(path, &rgba, sr.width as u32, sr.height as u32, image::ColorType::Rgba8) {
+            eprintln!("cannot write {path}: {e}");
+        }
+    }
+    world.renderer = Some(r);
 }
 
 /// `--frames N --bench`: run N frames as fast as possible, drawing each one,
@@ -208,8 +239,8 @@ impl App {
     fn to_scratch(&self, pos: PhysicalPosition<f64>) -> (f64, f64) {
         let Some(window) = &self.window else { return (0.0, 0.0) };
         let size = window.inner_size();
-        let x = 480.0 * (pos.x / size.width.max(1) as f64 - 0.5);
-        let y = -360.0 * (pos.y / size.height.max(1) as f64 - 0.5);
+        let x = scrust_runtime::stage_width() * (pos.x / size.width.max(1) as f64 - 0.5);
+        let y = -scrust_runtime::stage_height() * (pos.y / size.height.max(1) as f64 - 0.5);
         (x, y)
     }
 
@@ -236,12 +267,13 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("scrust").with_inner_size(LogicalSize::new(480.0 * self.scale, 360.0 * self.scale));
+        let attrs = Window::default_attributes().with_title("scrust").with_inner_size(LogicalSize::new(scrust_runtime::stage_width() * self.scale, scrust_runtime::stage_height() * self.scale));
         let window = Rc::new(event_loop.create_window(attrs).expect("window"));
         // Render at the window's physical resolution.
         let physical = window.inner_size();
-        let render_scale = (physical.width as f64 / 480.0).max(1.0);
+        let render_scale = (physical.width as f64 / scrust_runtime::stage_width()).max(1.0);
         let mut renderer = SoftRenderer::new(self.program, render_scale);
+        renderer.high_quality = self.world.options.hq;
         self.metal = attach_metal(&window, &mut renderer);
         if !self.metal {
             let context = softbuffer::Context::new(window.clone()).expect("display context");

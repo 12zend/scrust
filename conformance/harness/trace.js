@@ -4,7 +4,9 @@
 const fs = require('fs');
 const path = require('path');
 
-const VENDOR = path.join(__dirname, '..', 'vendor', 'scratch-vm');
+// SCRUST_REF_VM points at another checkout (e.g. TurboWarp/scratch-vm, whose
+// compiler is enabled by default).
+const VENDOR = process.env.SCRUST_REF_VM || path.join(__dirname, '..', 'vendor', 'scratch-vm');
 const EPOCH = 1577836800000; // keep in sync with scrust-runtime DETERMINISTIC_EPOCH_MS
 
 function mulberry32 (a) {

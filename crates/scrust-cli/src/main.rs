@@ -20,7 +20,7 @@ USAGE:
 OPTIONS:
     --compat=default|strict   strict enables the warp timer
     --warp-timer              yield from warp loops after 500 ms
-    --fps N                   frames per second (default 30)
+    --fps N                   frames per second (default: the project's TurboWarp setting, else 30)
     --turbo                   do not stop a frame on redraw requests
     --deterministic --seed N  virtual clock, seeded RNG
     --no-unbox                keep every variable as a dynamic Value
@@ -164,6 +164,18 @@ fn unsupported_report(p: &Program) -> Vec<String> {
     counts.into_iter().map(|((t, op), n)| format!("  {op}  (in {t:?}, {n}x)")).collect()
 }
 
+/// Frames per second from TurboWarp's project config (`setFramerate`: capped
+/// at 250, negative is 1, 0 means the display rate), 30 without one.
+fn tw_framerate(p: &Project) -> f64 {
+    match p.tw_config().framerate {
+        None => 30.0,
+        Some(f) if f > 250.0 => 250.0,
+        Some(f) if f < 0.0 => 1.0,
+        Some(f) if f == 0.0 => 60.0,
+        Some(f) => f,
+    }
+}
+
 fn sanitize(name: &str) -> String {
     let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
     let s = s.trim_matches('_').to_string();
@@ -193,8 +205,14 @@ fn emit(c: &Cli, comp: &Compiled, dir: &Path, headless: bool) -> Result<String, 
         warp_timer: c.warp_timer,
         opt_level: 3,
         codegen_units: 16,
-        fps: c.fps.unwrap_or(30.0),
-        turbo: c.turbo,
+        fps: c.fps.unwrap_or_else(|| tw_framerate(&comp.project)),
+        turbo: c.turbo || comp.project.tw_config().turbo,
+        fencing: comp.project.tw_config().fencing,
+        misc_limits: comp.project.tw_config().misc_limits,
+        max_clones: comp.project.tw_config().max_clones,
+        hq: comp.project.tw_config().hq,
+        stage_width: comp.project.tw_config().width.unwrap_or(480.0),
+        stage_height: comp.project.tw_config().height.unwrap_or(360.0),
         wasm,
         external_assets: c.external_assets,
         max_fn_lines: std::env::var("SCRUST_MAX_FN_LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(2000),

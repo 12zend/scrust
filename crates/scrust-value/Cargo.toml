@@ -7,3 +7,6 @@ description = "Scratch 3 value model: JS-compatible strings, casts, comparison a
 
 [dependencies]
 libm.workspace = true
+
+[build-dependencies]
+cc = "1.6"

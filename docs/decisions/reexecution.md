@@ -1,5 +1,5 @@
-# Re-executed blocks re-evaluate their inputs
+# Inputs of waiting blocks are evaluated once
 
-scratch-vm implements waiting by executing the same block again on every step, and `execute()` evaluates the block's inputs each time. Reporters have no side effects except drawing random numbers, so this is only visible in the random sequence. For bit-exact deterministic traces scrust re-evaluates RNG-consuming inputs of `repeat` (every iteration), `wait`, `wait until`, `repeat until`, `glide`, `broadcast and wait` and `switch backdrop and wait`. `glide to (random position)` re-draws its target on every step for the same reason.
+scratch-vm's interpreter waits by executing the same block again on every step and re-evaluates the block's inputs each time, which shows up as extra random numbers. TurboWarp's compiler evaluates them once: `repeat` reads its count once, `wait`, `broadcast and wait` and `procedures_call` evaluate their inputs once, and blocks run through the compatibility layer (`glide`, `glide to`, `switch backdrop and wait`, `say/think for secs`, `ask and wait`, `play sound until done`) receive one inputs object and only re-run the primitive. scrust follows TurboWarp. `glide to (random position)` therefore still draws a new target on every step (the primitive calls `getTargetXY` each time), and `wait until` / `repeat until` re-evaluate their condition as part of what they do.
 
-Inputs are evaluated in the order of the block's `inputs` object (JS key order); block-internal RNG use (list index `random`/`any`) happens after all inputs.
+Inputs are evaluated in the order of the generated JavaScript, i.e. argument order (`letter of` evaluates the string first); see [turbowarp.md](turbowarp.md).

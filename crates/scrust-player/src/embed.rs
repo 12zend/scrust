@@ -79,7 +79,8 @@ pub fn main(program: &'static ProgramDef, args: Args, scale: f64, frames_shm: Op
     world.current_msecs = world.clock_ms();
     world.timer_start = world.current_msecs;
     world.audio = RodioAudio::new(program).map(|a| Box::new(a) as Box<dyn scrust_runtime::Audio>);
-    let renderer = SoftRenderer::new(program, scale.clamp(0.25, 4.0));
+    let mut renderer = SoftRenderer::new(program, scale.clamp(0.25, 4.0));
+    renderer.high_quality = world.options.hq;
     let mut sink = FrameSink::Pipe { last: Vec::new() };
     #[cfg(unix)]
     if let Some(path) = frames_shm {
