@@ -44,7 +44,7 @@ class ProgramHost {
     _handle (message) {
         switch (message.type) {
         case 'frame':
-            this.handlers.onFrame(message.data, message.width, message.height);
+            this.handlers.onFrame(message.data, message.width, message.height, message.canvas);
             break;
         case 'threads':
             this.threads = message.count;

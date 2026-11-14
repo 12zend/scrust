@@ -20,6 +20,9 @@
   <canvas id="stage" tabindex="0"></canvas>
 </main>
 <script>
+__GL_JS__
+</script>
+<script>
 (async () => {
   const WASM_URL = "__WASM__";
   const WASM_BASE64 = "__WASM_BASE64__";
@@ -94,7 +97,9 @@
   } else {
     bytes = await (await fetch(WASM_URL)).arrayBuffer();
   }
-  const {instance} = await WebAssembly.instantiate(bytes, {env});
+  // Frames are drawn with WebGL2 straight into the stage canvas, or on the CPU without it.
+  const gl = createScrustGl(() => ex.memory.buffer, {canvas});
+  const {instance} = await WebAssembly.instantiate(bytes, {env, scrust_gl: gl.imports});
   ex = instance.exports;
 
   const scale = Math.min(3, Math.max(1, Math.round(window.devicePixelRatio || 1) * 2)) / 1;
@@ -103,7 +108,7 @@
   const height = ex.scrust_height();
   canvas.width = width;
   canvas.height = height;
-  const ctx2d = canvas.getContext('2d');
+  const ctx2d = ex.scrust_uses_gpu() ? null : canvas.getContext('2d');
   status.textContent = '';
 
   const encoder = new TextEncoder();
@@ -128,7 +133,7 @@
   canvas.focus();
 
   const frame = () => {
-    if (ex.scrust_frame(performance.now())) {
+    if (ex.scrust_frame(performance.now()) && ctx2d) {
       const view = new Uint8ClampedArray(ex.memory.buffer, ex.scrust_frame_ptr(), width * height * 4);
       ctx2d.putImageData(new ImageData(view, width, height), 0, 0);
     }

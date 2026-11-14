@@ -568,9 +568,18 @@ class ScrustRender extends EventEmitter {
         requestAnimationFrame(poll);
     }
 
-    /** Show a frame (straight RGBA bytes, opaque) rendered by the compiled program. */
-    showProgramFrame (rgba, width, height) {
-        if (!this._programCanvas || this._programCanvas.width !== width || this._programCanvas.height !== height) {
+    /**
+     * Show a frame (straight RGBA bytes, opaque) rendered by the compiled
+     * program, or the canvas it drew the frame in (the browser build's
+     * WebGL renderer; copied without leaving the GPU).
+     */
+    showProgramFrame (rgba, width, height, canvas) {
+        if (canvas) {
+            this._programCanvas = canvas;
+            this._blitProgram();
+            return;
+        }
+        if (!this._programCanvas || this._programCanvas.getContext('2d') === null || this._programCanvas.width !== width || this._programCanvas.height !== height) {
             this._programCanvas = document.createElement('canvas');
             this._programCanvas.width = width;
             this._programCanvas.height = height;

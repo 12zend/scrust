@@ -40,7 +40,7 @@ Options: `--fps N` (default 30), `--turbo`, `--warp-timer` / `--compat=strict`, 
 | `scrust-analysis` | type lattice, storage types, kind-sensitivity, representations, yield analysis |
 | `scrust-codegen` | IR → Rust (typed expressions, async/sync procedure variants) |
 | `scrust-runtime` | scheduler, world, block primitives, trace |
-| `scrust-render` | Metal (macOS) and CPU compositors, collision, pen, bubbles, monitors |
+| `scrust-render` | Metal (macOS), WebGL2 (wasm) and CPU compositors, collision, pen, bubbles, monitors |
 | `scrust-player` | native window + audio, web host, embedded host for the GUI (`--embed`) |
 | `scrust-node` | Node-API addon over `scrust-render`'s scene, the GUI's stage renderer |
 | `scrust-scene-wasm` | the same scene as a WebAssembly module, for the GUI's browser build |

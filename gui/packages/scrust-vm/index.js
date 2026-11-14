@@ -127,8 +127,8 @@ class ScrustSession {
         const ratio = renderer ? renderer.canvas.width / 480 : 1;
         const scale = Math.min(2, Math.max(1, Math.round(ratio * 2) / 2));
         const host = new ProgramHost({
-            onFrame: (data, width, height) => {
-                if (this.host === host && this.renderer) this.renderer.showProgramFrame(data, width, height);
+            onFrame: (data, width, height, canvas) => {
+                if (this.host === host && this.renderer) this.renderer.showProgramFrame(data, width, height, canvas);
             },
             onState: state => {
                 if (this.host !== host) return;

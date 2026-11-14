@@ -15,6 +15,8 @@
  *   Electron main process sends.
  */
 
+const createScrustGl = require('../../crates/scrust-render/web/gl.js');
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -32,7 +34,10 @@ const fetchBytes = async url => {
  * @param {string} url of scrust-scene.wasm
  */
 async function loadScene (url) {
-    const {instance} = await WebAssembly.instantiate(await fetchBytes(url), {});
+    // The editor's scene draws on the CPU: it is redrawn only when the
+    // editor changes, and reading a WebGL frame back costs as much.
+    const gl = createScrustGl(() => null, {disabled: true});
+    const {instance} = await WebAssembly.instantiate(await fetchBytes(url), {scrust_gl: gl.imports});
     const ex = instance.exports;
     // Views are made after each call: the module's memory may have grown.
     const put = bytes => {
@@ -210,6 +215,9 @@ class WasmProgram {
         this.post = post;
         this.ex = null;
         this.audio = new ProgramAudio();
+        // The program draws its frames with WebGL2 into this.gl.canvas
+        // (crates/scrust-render/web/gl.js), or on the CPU without WebGL2.
+        this.gl = createScrustGl(() => this.ex.memory.buffer);
         this.panic = '';
         this.lastThreads = null;
         this.raf = 0;
@@ -231,7 +239,7 @@ class WasmProgram {
                 this.panic = decoder.decode(new Uint8Array(this.ex.memory.buffer, ptr, len));
             }
         };
-        const instance = await WebAssembly.instantiate(this.module, {env});
+        const instance = await WebAssembly.instantiate(this.module, {env, scrust_gl: this.gl.imports});
         const ex = instance.exports;
         this.ex = ex;
         audio.ex = ex;
@@ -263,9 +271,14 @@ class WasmProgram {
             if (ex.scrust_frame(performance.now())) {
                 const width = ex.scrust_width();
                 const height = ex.scrust_height();
-                // A view of the module's memory; the renderer copies it at once.
-                const data = new Uint8Array(ex.memory.buffer, ex.scrust_frame_ptr(), width * height * 4);
-                this.post({type: 'frame', width, height, data});
+                if (ex.scrust_uses_gpu()) {
+                    // Drawn with WebGL: the stage copies the canvas on the GPU.
+                    this.post({type: 'frame', width, height, data: null, canvas: this.gl.canvas});
+                } else {
+                    // A view of the module's memory; the renderer copies it at once.
+                    const data = new Uint8Array(ex.memory.buffer, ex.scrust_frame_ptr(), width * height * 4);
+                    this.post({type: 'frame', width, height, data});
+                }
             }
             const threads = ex.scrust_threads();
             if (threads !== this.lastThreads) {

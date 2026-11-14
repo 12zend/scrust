@@ -8,13 +8,16 @@
 pub mod frames;
 #[cfg(target_os = "macos")]
 mod gpu;
+#[cfg(target_arch = "wasm32")]
+#[path = "webgl.rs"]
+mod gpu;
 pub mod scene;
 mod color;
 mod skin;
 mod text;
 
 /// Placeholder where there is no GPU backend: never constructed.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_arch = "wasm32")))]
 mod gpu {
     use crate::skin::{Raster, Skin};
     use crate::Draw;

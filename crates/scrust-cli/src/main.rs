@@ -400,6 +400,10 @@ fn real_main() -> Result<ExitCode, String> {
                     if c.target == "wasm" {
                         let html = crates_dir().join("scrust-player").join("web").join("index.html");
                         let page = std::fs::read_to_string(&html).map_err(|e| format!("cannot read {}: {e}", html.display()))?;
+                        // The WebGL2 glue of the renderer (`scrust_gl` imports), inlined.
+                        let gl_js = crates_dir().join("scrust-render").join("web").join("gl.js");
+                        let gl_js = std::fs::read_to_string(&gl_js).map_err(|e| format!("cannot read {}: {e}", gl_js.display()))?;
+                        let page = page.replace("__GL_JS__", &gl_js.replace("</script", "<\\/script"));
                         let page = if c.single_html {
                             let data = std::fs::read(&dest).map_err(|e| e.to_string())?;
                             let _ = std::fs::remove_file(&dest);

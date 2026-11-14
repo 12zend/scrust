@@ -1,6 +1,8 @@
 //! Browser host. The generated program is a `cdylib`; the page (see
 //! `web/index.html`) drives it through these exports and provides audio
-//! through a few imports. No wasm-bindgen is involved.
+//! through a few imports, and WebGL2 through the `scrust_gl` imports
+//! (`crates/scrust-render/web/gl.js`; without it frames are RGBA in
+//! memory). No wasm-bindgen is involved.
 
 use crate::input::key_event;
 use scrust_render::SoftRenderer;
@@ -170,6 +172,12 @@ pub extern "C" fn scrust_frame(now_ms: f64) -> u32 {
         }
         let Some(mut r) = st.world.renderer.take() else { return 0 };
         if let Some(sr) = r.as_any_mut().downcast_mut::<SoftRenderer>() {
+            if sr.uses_gpu() {
+                // WebGL draws straight into the page's canvas (`scrust_gl`).
+                sr.draw_to_view(&st.world);
+                st.world.renderer = Some(r);
+                return 1;
+            }
             sr.draw(&st.world);
             for (o, p) in st.rgba.chunks_exact_mut(4).zip(sr.frame.iter()) {
                 o[0] = (p >> 16) as u8;
@@ -182,6 +190,13 @@ pub extern "C" fn scrust_frame(now_ms: f64) -> u32 {
         1
     })
     .unwrap_or(0)
+}
+
+/// 1 when frames are drawn with WebGL into the `scrust_gl` glue's canvas
+/// (`scrust_frame_ptr` is then not updated), 0 when they are RGBA in memory.
+#[no_mangle]
+pub extern "C" fn scrust_uses_gpu() -> u32 {
+    with(|st| st.world.renderer.as_mut().and_then(|r| r.as_any_mut().downcast_mut::<SoftRenderer>()).is_some_and(|r| r.uses_gpu()) as u32).unwrap_or(0)
 }
 
 #[no_mangle]
