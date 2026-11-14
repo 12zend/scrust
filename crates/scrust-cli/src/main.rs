@@ -1,9 +1,9 @@
 //! `scrust`: compile Scratch 3 projects (.sb3) to Rust.
 
-use scrust_analysis::{Analysis, Node, Ty};
+use scrust_analysis::Node;
+use scrust_codegen::frontend::{self, tw_framerate, unsupported_report, Compiled};
 use scrust_codegen::GenOptions;
-use scrust_ir::{ListId, Program, VarId};
-use scrust_sb3::Project;
+use scrust_ir::{ListId, VarId};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -15,7 +15,7 @@ USAGE:
     scrust run   <in.sb3> [options] [-- program args]
     scrust emit  <in.sb3> -o crate/ [options]
     scrust check <in.sb3> [--types]
-    scrust trace <in.sb3> --frames N [options]
+    scrust trace <in.sb3> --frames N [options]  (--interp: run the IR interpreter instead of compiling)
 
 OPTIONS:
     --compat=default|strict   strict enables the warp timer
@@ -54,6 +54,7 @@ struct Cli {
     answers: Option<String>,
     debug: bool,
     single_html: bool,
+    interp: bool,
     external_assets: bool,
     passthrough: Vec<String>,
 }
@@ -85,6 +86,7 @@ fn parse() -> Result<Cli, String> {
             "--deterministic" => c.deterministic = true,
             "--seed" => c.seed = Some(val(&mut i)?.parse().map_err(|_| "bad --seed")?),
             "--no-unbox" => c.no_unbox = true,
+            "--interp" => c.interp = true,
             "--allow-unsupported" => c.allow_unsupported = true,
             "--headless" => c.headless = true,
             "--types" => c.types = true,
@@ -116,64 +118,10 @@ fn crates_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
 }
 
-struct Compiled {
-    project: Project,
-    program: Program,
-    analysis: Analysis,
-}
-
 fn compile(c: &Cli) -> Result<Compiled, String> {
     let input = c.input.as_ref().ok_or("missing input .sb3")?;
     let bytes = std::fs::read(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
-    let project = Project::load(&bytes).map_err(|e| e.to_string())?;
-    let program = scrust_ir::lower(&project, &Default::default());
-    let mut opts = scrust_analysis::Options { no_unbox: c.no_unbox, warp_timer: c.warp_timer, ..Default::default() };
-    for m in &project.monitors {
-        let sprite = match &m.sprite_name {
-            Some(n) => program.targets.iter().position(|t| !t.is_stage && t.name == *n),
-            None => Some(0),
-        };
-        let Some(ti) = sprite else { continue };
-        let t = &program.targets[ti];
-        match m.opcode.as_str() {
-            "data_variable" => {
-                if let Some(i) = t.vars.iter().position(|v| v.id == m.id) {
-                    opts.monitored_vars.push(VarId { target: ti, index: i });
-                }
-            }
-            "data_listcontents" => {
-                if let Some(i) = t.lists.iter().position(|v| v.id == m.id) {
-                    opts.monitored_lists.push(ListId { target: ti, index: i });
-                }
-            }
-            _ => {}
-        }
-    }
-    let canonical = |name: &str| Ty::of_value(&scrust_value::Value::str(name)).within(Ty::STR_CANON);
-    opts.numeric_asset_names =
-        project.targets.iter().any(|t| t.costumes.iter().any(|x| canonical(&x.name)) || t.sounds.iter().any(|x| canonical(&x.name)));
-    let analysis = Analysis::run(&program, opts);
-    Ok(Compiled { project, program, analysis })
-}
-
-fn unsupported_report(p: &Program) -> Vec<String> {
-    let mut counts: std::collections::BTreeMap<(String, String), usize> = Default::default();
-    for (t, op) in &p.unsupported {
-        *counts.entry((t.clone(), op.clone())).or_default() += 1;
-    }
-    counts.into_iter().map(|((t, op), n)| format!("  {op}  (in {t:?}, {n}x)")).collect()
-}
-
-/// Frames per second from TurboWarp's project config (`setFramerate`: capped
-/// at 250, negative is 1, 0 means the display rate), 30 without one.
-fn tw_framerate(p: &Project) -> f64 {
-    match p.tw_config().framerate {
-        None => 30.0,
-        Some(f) if f > 250.0 => 250.0,
-        Some(f) if f < 0.0 => 1.0,
-        Some(f) if f == 0.0 => 60.0,
-        Some(f) => f,
-    }
+    frontend::compile(&bytes, c.no_unbox, c.warp_timer)
 }
 
 fn sanitize(name: &str) -> String {
@@ -409,6 +357,23 @@ fn real_main() -> Result<ExitCode, String> {
             let dir = c.out.clone().ok_or("emit requires -o <dir>")?;
             emit(&c, &comp, &dir, c.headless)?;
             println!("wrote {}", dir.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        "trace" if c.interp => {
+            // The interpreter (scrust-interp) instead of a compiled program,
+            // with the same runtime flags.
+            let input = c.input.as_ref().ok_or("missing input .sb3")?;
+            let bytes = std::fs::read(input).map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+            let cfg = scrust_interp::Config { fps: c.fps, turbo: c.turbo, warp_timer: c.warp_timer, headless: true };
+            let built = scrust_interp::build(&bytes, &cfg)?;
+            if !built.unsupported.is_empty() && !c.allow_unsupported {
+                return Err(format!("unsupported blocks (use --allow-unsupported to run anyway; they become no-ops):\n{}", built.unsupported.join("\n")));
+            }
+            let frames = c.frames.ok_or("trace requires --frames N")?;
+            let mut argv = vec!["--deterministic".to_string()];
+            argv.extend(runtime_flags(&c));
+            argv.extend(["--trace".to_string(), frames.to_string()]);
+            scrust_runtime::cli::main_with_args(built.program, built.options, &argv);
             Ok(ExitCode::SUCCESS)
         }
         "build" | "run" | "trace" => {

@@ -5,15 +5,12 @@
 //                                          renderer addon (crates/scrust-node)
 //                                          and the GUI bundle in build/
 //   node scripts/build.js --gui-only       only the Electron app's webpack bundle
-//   node scripts/build.js --web            browser version: the scrust CLI (for
-//                                          the compile server), the scene module
-//                                          (crates/scrust-scene-wasm, wasm32) and
-//                                          the bundle in build-web/
-//   node scripts/build.js --web --gui-only only the browser version's bundle and
-//                                          scene module (no CLI: for static hosting)
-//
-// SCRUST_COMPILER_URL (with --web): origin of the compile server when the page
-// is hosted elsewhere, e.g. https://compile.example.com.
+//   node scripts/build.js --web            browser version in build-web/ (static
+//                                          files): the bundle, the scene module
+//                                          (crates/scrust-scene-wasm) and the
+//                                          interpreter (crates/scrust-interp),
+//                                          both built for wasm32
+//   node scripts/build.js --web --gui-only only the browser version's bundle
 
 const {execFileSync} = require('child_process');
 const fs = require('fs');
@@ -30,11 +27,14 @@ const sh = (cmd, args, options) => {
     execFileSync(cmd, args, Object.assign({stdio: 'inherit'}, options));
 };
 
+const WASM_OUT = path.join(REPO, 'target', 'wasm32-unknown-unknown', 'release');
+
 if (!GUI_ONLY) {
-    sh('cargo', ['build', '--release', '-p', 'scrust-cli'].concat(WEB ? [] : ['-p', 'scrust-node']), {cwd: REPO});
-}
-if (WEB) {
-    sh('cargo', ['build', '--release', '-p', 'scrust-scene-wasm', '--target', 'wasm32-unknown-unknown'], {cwd: REPO});
+    if (WEB) {
+        sh('cargo', ['build', '--release', '-p', 'scrust-scene-wasm', '-p', 'scrust-interp', '--target', 'wasm32-unknown-unknown'], {cwd: REPO});
+    } else {
+        sh('cargo', ['build', '--release', '-p', 'scrust-cli', '-p', 'scrust-node'], {cwd: REPO});
+    }
 }
 
 sh(process.execPath, [path.join(VENDOR, 'node_modules', 'webpack', 'bin', 'webpack.js'), '--config', path.join(GUI_DIR, 'webpack.config.js')], {
@@ -48,8 +48,8 @@ sh(process.execPath, [path.join(VENDOR, 'node_modules', 'webpack', 'bin', 'webpa
 });
 
 if (WEB) {
-    const scene = path.join(REPO, 'target', 'wasm32-unknown-unknown', 'release', 'scrust_scene_wasm.wasm');
-    fs.copyFileSync(scene, path.join(GUI_DIR, 'build-web', 'scrust-scene.wasm'));
+    fs.copyFileSync(path.join(WASM_OUT, 'scrust_scene_wasm.wasm'), path.join(GUI_DIR, 'build-web', 'scrust-scene.wasm'));
+    fs.copyFileSync(path.join(WASM_OUT, 'scrust_interp.wasm'), path.join(GUI_DIR, 'build-web', 'scrust-interp.wasm'));
     // The site root opens the editor too (the GUI then shows editor.html).
     fs.copyFileSync(path.join(GUI_DIR, 'build-web', 'editor.html'), path.join(GUI_DIR, 'build-web', 'index.html'));
     console.log(`built ${path.join(GUI_DIR, 'build-web')}`);

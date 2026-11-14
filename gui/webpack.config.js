@@ -11,7 +11,6 @@ const path = require('path');
 const GUI = path.resolve(__dirname, 'vendor', 'scratch-gui');
 const guiRequire = name => require(path.join(GUI, 'node_modules', name));
 const HtmlWebpackPlugin = guiRequire('html-webpack-plugin');
-const webpack = guiRequire('webpack');
 
 const WEB = process.env.SCRUST_GUI_TARGET === 'web';
 
@@ -50,9 +49,6 @@ module.exports = Object.assign({}, base, {
                 root: '',
                 meta: {},
                 APP_NAME: 'scrust'
-            }),
-            new webpack.DefinePlugin({
-                'process.env.SCRUST_COMPILER_URL': JSON.stringify(process.env.SCRUST_COMPILER_URL || '')
             })
         ])
 });

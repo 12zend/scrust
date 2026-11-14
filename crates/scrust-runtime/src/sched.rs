@@ -121,7 +121,6 @@ impl World {
         self.sched.next_tid += 1;
         let sprite = self.targets[target.idx as usize].sprite;
         let def = &self.program.sprites[sprite].scripts[script];
-        let start = def.start;
         for c in def.creates {
             if !self.created[sprite].contains(c) {
                 self.created[sprite].push(*c);
@@ -131,7 +130,7 @@ impl World {
             tid,
             target,
             script,
-            fut: Some(start(target)),
+            fut: Some((def.start)(target)),
             status: Status::Running,
             killed: false,
             wake: None,
@@ -194,7 +193,7 @@ impl World {
                     continue;
                 };
                 let sprite = self.targets[target.idx as usize].sprite;
-                let Some(pred) = program.sprites[sprite].scripts[script].pred else { continue };
+                let Some(pred) = program.sprites[sprite].scripts[script].pred.as_ref() else { continue };
                 let value = pred(self, target);
                 let tg = &mut self.targets[target.idx as usize];
                 if tg.edge_values.len() <= script {

@@ -1890,7 +1890,9 @@ version = "0.1.0"
 dependencies = [
  "scrust-analysis",
  "scrust-codegen",
+ "scrust-interp",
  "scrust-ir",
+ "scrust-runtime",
  "scrust-sb3",
  "scrust-value",
 ]
@@ -1901,6 +1903,19 @@ version = "0.1.0"
 dependencies = [
  "scrust-analysis",
  "scrust-ir",
+ "scrust-sb3",
+ "scrust-value",
+]
+
+[[package]]
+name = "scrust-interp"
+version = "0.1.0"
+dependencies = [
+ "scrust-analysis",
+ "scrust-codegen",
+ "scrust-ir",
+ "scrust-player",
+ "scrust-runtime",
  "scrust-sb3",
  "scrust-value",
 ]

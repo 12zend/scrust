@@ -1,5 +1,9 @@
 // Differential test runner: scratch-vm (ground truth) vs scrust.
-//   node run.js [--only substr] [--mode both|nounbox|unbox] [--release] [--keep-going] [--jobs N]
+//   node run.js [--only substr] [--mode both|nounbox|unbox|interp|all] [--ref scratch-vm|compiled] [--release] [--keep-going] [--jobs N]
+// Mode `interp` runs the IR interpreter (scrust-interp, `scrust trace --interp`).
+// `--ref compiled` takes the compiled `--no-unbox` program as the reference
+// instead of scratch-vm (no scratch-vm checkout needed): it checks the
+// interpreter and the unboxed build against the compiler.
 // Test cases live in ../tests/*.js; each module exports an array of
 //   {name, project (Project) | json, frames, seed?, fps?, maxPasses?, turbo?, answers?}
 const fs = require('fs');
@@ -8,13 +12,14 @@ const {execFile, execFileSync} = require('child_process');
 
 const ROOT = path.join(__dirname, '..', '..');
 const OUT = path.join(ROOT, 'conformance', 'out');
-const SCRUST = path.join(ROOT, 'target', 'debug', 'scrust');
+const SCRUST = path.join(ROOT, 'target', process.argv.includes('--release') ? 'release' : 'debug', 'scrust');
 
 const argv = process.argv.slice(2);
-const opt = {only: null, mode: 'both', release: false, jobs: 4, verbose: false};
+const opt = {only: null, mode: 'both', ref: 'scratch-vm', release: false, jobs: 4, verbose: false};
 for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--only') opt.only = argv[++i];
     else if (argv[i] === '--mode') opt.mode = argv[++i];
+    else if (argv[i] === '--ref') opt.ref = argv[++i];
     else if (argv[i] === '--release') opt.release = true;
     else if (argv[i] === '--jobs') opt.jobs = Number(argv[++i]);
     else if (argv[i] === '-v') opt.verbose = true;
@@ -85,15 +90,18 @@ async function runCase (c) {
     const common = ['--frames', String(c.frames || 30), '--seed', String(c.seed || 1), '--fps', String(c.fps || 30), '--max-passes', String(c.maxPasses || 1)];
     if (c.turbo) common.push('--turbo');
     if (c.answers) common.push('--answers', c.answers.join('|'));
-    const ref = await run('node', [path.join(__dirname, 'trace.js'), file, ...common]);
-    if (ref.err) return {name: c.name, ok: false, msg: `scratch-vm tracer failed: ${ref.stderr.slice(0, 2000)}`};
+    const ref = opt.ref === 'compiled' ?
+        await run(SCRUST, ['trace', file, ...common, '--allow-unsupported', '--no-unbox'].concat(opt.release ? [] : ['--debug'])) :
+        await run('node', [path.join(__dirname, 'trace.js'), file, ...common]);
+    if (ref.err) return {name: c.name, ok: false, msg: `${opt.ref} tracer failed: ${ref.stderr.slice(-2000)}`};
     const exp = ref.stdout.trim().split('\n');
     const results = [];
-    const modes = opt.mode === 'both' ? ['nounbox', 'unbox'] : [opt.mode];
+    const modes = {both: ['nounbox', 'unbox'], all: ['nounbox', 'unbox', 'interp']}[opt.mode] || [opt.mode];
     for (const mode of modes) {
         const args = ['trace', file, ...common, '--allow-unsupported'];
         if (mode === 'nounbox') args.push('--no-unbox');
-        if (!opt.release) args.push('--debug');
+        if (mode === 'interp') args.push('--interp');
+        else if (!opt.release) args.push('--debug');
         const got = await run(SCRUST, args);
         if (got.err) { results.push(`[${mode}] scrust failed: ${(got.stderr || String(got.err)).slice(-1500)}`); continue; }
         let g = got.stdout.trim().split('\n');
@@ -107,7 +115,7 @@ async function runCase (c) {
 
 async function main () {
     fs.mkdirSync(OUT, {recursive: true});
-    execFileSync('cargo', ['build', '-q', '-p', 'scrust-cli'], {cwd: ROOT, stdio: 'inherit'});
+    execFileSync('cargo', ['build', '-q', '-p', 'scrust-cli'].concat(opt.release ? ['--release'] : []), {cwd: ROOT, stdio: 'inherit'});
     let cases = [];
     const dir = path.join(__dirname, '..', 'tests');
     for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.js')).sort()) {

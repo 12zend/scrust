@@ -98,7 +98,8 @@ class ScrustSession {
             this.status.error('scrust のコンパイラに接続できません。Electron 版 (gui/) から起動してください。');
             return false;
         }
-        this.status.busy(COMPILE_HINT);
+        // The browser build interprets instead of compiling and says so.
+        this.status.busy(compiler.busyText || COMPILE_HINT);
         // Edits made while compiling mark the result stale again.
         this.changed = false;
         this.compiledKey = null;

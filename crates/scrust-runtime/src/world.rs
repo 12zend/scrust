@@ -224,6 +224,15 @@ pub struct SoundDef {
     pub sample_count: f64,
 }
 
+/// Starts a thread of a script.
+pub type StartFn = Box<dyn Fn(TargetRef) -> BoxFut + Send + Sync>;
+/// Predicate of an edge-activated hat.
+pub type PredFn = Box<dyn Fn(&mut World, TargetRef) -> bool + Send + Sync>;
+/// Creates a target's variable storage.
+pub type NewLocalsFn = Box<dyn Fn() -> Box<dyn Locals> + Send + Sync>;
+
+/// The entry points are boxed closures rather than function pointers so that
+/// a program can also be built at run time (`scrust-interp`).
 pub struct ScriptDef {
     pub kind: HatKind,
     /// Upper-cased match field (key name, backdrop name).
@@ -231,9 +240,9 @@ pub struct ScriptDef {
     /// Message index for broadcast hats.
     pub msg: usize,
     pub restart: bool,
-    pub start: fn(TargetRef) -> BoxFut,
+    pub start: StartFn,
     /// Predicate of edge-activated hats.
-    pub pred: Option<fn(&mut World, TargetRef) -> bool>,
+    pub pred: Option<PredFn>,
     /// Undeclared variables (`false`) and lists (`true`) by index that
     /// TurboWarp creates when it compiles this script (its first start).
     pub creates: &'static [(bool, u16)],
@@ -245,7 +254,7 @@ pub struct SpriteDef {
     pub costumes: Vec<CostumeDef>,
     pub sounds: Vec<SoundDef>,
     pub scripts: Vec<ScriptDef>,
-    pub new_locals: fn() -> Box<dyn Locals>,
+    pub new_locals: NewLocalsFn,
     pub x: f64,
     pub y: f64,
     pub size: f64,

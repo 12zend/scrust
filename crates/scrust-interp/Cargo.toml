@@ -1,0 +1,20 @@
+[package]
+name = "scrust-interp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs a Scratch project from its IR without compiling it to Rust: the browser build of the GUI, where rustc is not available"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+scrust-value.workspace = true
+scrust-sb3.workspace = true
+scrust-ir.workspace = true
+scrust-analysis.workspace = true
+scrust-codegen.workspace = true
+scrust-runtime.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+scrust-player = { workspace = true, features = ["embedded-font"] }

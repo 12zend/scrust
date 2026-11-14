@@ -19,6 +19,7 @@ scrust-render = { path = "crates/scrust-render" }
 scrust-node = { path = "crates/scrust-node" }
 scrust-audio = { path = "crates/scrust-audio" }
 scrust-player = { path = "crates/scrust-player" }
+scrust-interp = { path = "crates/scrust-interp" }
 libm = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }

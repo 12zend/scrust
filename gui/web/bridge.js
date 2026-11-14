@@ -5,10 +5,12 @@
  *
  * - `scrustNative.scene`: the editor's renderer, scrust_render::Scene built
  *   for wasm32 (crates/scrust-scene-wasm) instead of the Node-API addon;
- * - `scrustCompiler`: the green flag posts the project to the compile server
- *   (gui/web/server.js), which returns the program built for wasm32; it runs
- *   here, in the page, driven once per animation frame, instead of as a
- *   native child process. Input arrives as the embed protocol's text lines
+ * - `scrustCompiler`: there is no rustc in a browser, so the green flag
+ *   hands the project to scrust's interpreter (crates/scrust-interp), one
+ *   WebAssembly module with the front end, the runtime and the renderer: it
+ *   loads the .sb3 and runs it in the page, driven once per animation frame,
+ *   instead of a compiled native child process. Nothing leaves the browser.
+ *   Input arrives as the embed protocol's text lines
  *   (crates/scrust-player/src/embed.rs) and messages go back in the shape the
  *   Electron main process sends.
  */
@@ -201,7 +203,7 @@ const unhex = hex => {
     return decoder.decode(bytes);
 };
 
-/** A compiled program running in this page. */
+/** One run of a project in this page: a fresh instance of the interpreter. */
 class WasmProgram {
     constructor (module, post) {
         this.module = module;
@@ -211,10 +213,15 @@ class WasmProgram {
         this.panic = '';
         this.lastThreads = null;
         this.raf = 0;
+        this.started = false;
         this.stopped = false;
     }
 
-    async start (scale) {
+    /**
+     * Instantiate the interpreter and load the project into it.
+     * @returns {Promise<{ok: boolean, message: string}>} unsupported blocks, or the error
+     */
+    async load (sb3, options) {
         const audio = this.audio;
         const env = {
             js_sound_play: (...a) => audio.play(...a),
@@ -225,11 +232,26 @@ class WasmProgram {
             }
         };
         const instance = await WebAssembly.instantiate(this.module, {env});
-        this.ex = instance.exports;
-        audio.ex = this.ex;
-        // Starting the program is the green flag: it starts on a click, so
-        // the browser lets the audio context run.
-        audio.ensure();
+        const ex = instance.exports;
+        this.ex = ex;
+        audio.ex = ex;
+        try {
+            const ptr = ex.scrust_input(sb3.length);
+            new Uint8Array(ex.memory.buffer, ptr, sb3.length).set(sb3);
+            const ok = ex.scrust_load(options.fps || 0, options.turbo ? 1 : 0);
+            const message = decoder.decode(new Uint8Array(ex.memory.buffer, ex.scrust_message_ptr(), ex.scrust_message_len()));
+            return {ok: !!ok, message};
+        } catch (e) {
+            return {ok: false, message: this.panic || String((e && e.message) || e)};
+        }
+    }
+
+    /** Start the loaded project (its green flag is clicked). */
+    start (scale) {
+        this.started = true;
+        // Starting follows a click on the green flag, so the browser lets
+        // the audio context run.
+        this.audio.ensure();
         this.ex.scrust_init(scale, (Math.random() * 4294967296) >>> 0, Date.now() - performance.now(), -new Date().getTimezoneOffset());
         this.raf = requestAnimationFrame(() => this._frame());
     }
@@ -318,10 +340,23 @@ class WasmProgram {
 }
 
 /**
- * @param {string} compileUrl the compile server's /api/compile
+ * The green flag's "compiler": scrust's interpreter running in this page.
+ * @param {string} url of scrust-interp.wasm
  */
-function createCompiler (compileUrl) {
-    let module = null;
+function createInterpreter (url) {
+    let modulePromise = null;
+    const getModule = () => {
+        if (!modulePromise) {
+            modulePromise = fetchBytes(url).then(bytes => WebAssembly.compile(bytes));
+            modulePromise.catch(() => {
+                modulePromise = null;
+            });
+        }
+        return modulePromise;
+    };
+    let project = null;
+    /** Loaded by the last compile and not run yet. */
+    let prepared = null;
     let program = null;
     const listeners = [];
     const post = message => listeners.forEach(cb => cb(message));
@@ -331,44 +366,54 @@ function createCompiler (compileUrl) {
         program = null;
     };
 
+    const newRun = () => {
+        const me = new WasmProgram(null, message => {
+            if (program === me) post(message);
+        });
+        return me;
+    };
+
     return {
+        busyText: 'プロジェクトを読み込み中…',
         /**
-         * Compile the project to WebAssembly (on the compile server).
+         * Load the project into the interpreter (it reports unsupported blocks).
          * @param {Uint8Array} sb3 the project
          * @param {{fps: number, turbo: boolean}} options
          * @returns {Promise<{ok: boolean, warnings?: string, log: string}>}
          */
         async compile (sb3, options) {
             stop();
-            module = null;
-            const query = `fps=${encodeURIComponent(options.fps || 30)}&turbo=${options.turbo ? 1 : 0}`;
-            let res;
+            project = null;
+            prepared = null;
+            let module;
             try {
-                res = await fetch(`${compileUrl}?${query}`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/x.scratch.sb3'},
-                    body: sb3
-                });
+                module = await getModule();
             } catch (e) {
-                return {ok: false, log: `コンパイルサーバー (${compileUrl}) に接続できません: ${e.message || e}`};
+                return {ok: false, log: `cannot load the scrust interpreter (${url}): ${e.message || e}`};
             }
-            if (!res.ok) return {ok: false, log: (await res.text()) || `HTTP ${res.status}`};
-            try {
-                module = await WebAssembly.compile(await res.arrayBuffer());
-            } catch (e) {
-                return {ok: false, log: `invalid WebAssembly from the compile server: ${e.message || e}`};
-            }
-            return {ok: true, warnings: decodeURIComponent(res.headers.get('X-Scrust-Warnings') || ''), log: ''};
+            const run = newRun();
+            run.module = module;
+            const result = await run.load(sb3, options);
+            if (!result.ok) return {ok: false, log: result.message || 'failed to load the project'};
+            project = {sb3, options};
+            prepared = run;
+            return {ok: true, warnings: result.message, log: ''};
         },
-        /** Start the last compiled program (it receives the green flag); resolves to {framesPath: null}. */
+        /** Start the last loaded project (it receives the green flag); resolves to {framesPath: null}. */
         async start (options) {
             stop();
-            if (!module) throw new Error('no compiled program');
-            const me = new WasmProgram(module, message => {
-                if (program === me) post(message);
-            });
-            program = me;
-            await me.start((options && options.scale) || 1);
+            if (!project) throw new Error('no compiled program');
+            let run = prepared;
+            prepared = null;
+            if (!run) {
+                // Every run gets a fresh instance (a run's data lives as long as it).
+                run = newRun();
+                run.module = await getModule();
+                const result = await run.load(project.sb3, project.options);
+                if (!result.ok) throw new Error(result.message);
+            }
+            program = run;
+            run.start((options && options.scale) || 1);
             return {framesPath: null};
         },
         send: line => {
@@ -381,4 +426,4 @@ function createCompiler (compileUrl) {
     };
 }
 
-module.exports = {loadScene, createCompiler};
+module.exports = {loadScene, createInterpreter};

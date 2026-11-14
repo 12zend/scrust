@@ -1,6 +1,7 @@
 //! Typed IR -> Rust source (a Cargo crate depending on `scrust-runtime`).
 
 mod expr;
+pub mod frontend;
 
 use expr::{cast, f64_lit, str_lit, val_lit, Cx, E, RT};
 use scrust_analysis::{Analysis, Node, Owner, Repr};
@@ -265,11 +266,11 @@ impl<'a> Gen<'a> {
                     Hat::StartAsClone => ("Clone", String::new(), 0),
                     Hat::TouchingObject(_) => ("Touching", String::new(), 0),
                 };
-                let pred = if sc.hat.is_edge_activated() { format!("Some(t{ti}_s{si}_pred)") } else { "None".to_string() };
+                let pred = if sc.hat.is_edge_activated() { format!("Some(Box::new(t{ti}_s{si}_pred))") } else { "None".to_string() };
                 let creates: Vec<String> = self.created_on_compile(ti, &sc.body).iter().map(|(l, i)| format!("({l}, {i})")).collect();
                 let _ = writeln!(
                     s,
-                    "                    ScriptDef {{ kind: HatKind::{}, field: {}, msg: {}, restart: {}, start: t{ti}_s{si}, pred: {}, creates: &[{}] }},",
+                    "                    ScriptDef {{ kind: HatKind::{}, field: {}, msg: {}, restart: {}, start: Box::new(t{ti}_s{si}), pred: {}, creates: &[{}] }},",
                     kind,
                     rust_str(&field),
                     msg,
@@ -285,7 +286,7 @@ impl<'a> Gen<'a> {
             };
             let _ = writeln!(
                 s,
-                "                ],\n                new_locals: new_l{ti},\n                x: {}, y: {}, size: {}, direction: {}, visible: {}, draggable: {}, costume: {}, rotation_style: RotationStyle::{}, volume: {},\n                declared_vars: {}, declared_lists: {}, tempo: {},\n            }},",
+                "                ],\n                new_locals: Box::new(new_l{ti}),\n                x: {}, y: {}, size: {}, direction: {}, visible: {}, draggable: {}, costume: {}, rotation_style: RotationStyle::{}, volume: {},\n                declared_vars: {}, declared_lists: {}, tempo: {},\n            }},",
                 f64_lit(src.x),
                 f64_lit(src.y),
                 f64_lit(src.size),
@@ -336,7 +337,39 @@ impl<'a> Gen<'a> {
     /// creates them when it compiles the script (`_descendVariable`), in the
     /// order it meets them.
     fn created_on_compile(&self, ti: usize, body: &[Stmt]) -> Vec<(bool, u16)> {
-        let src = &self.project.targets[ti];
+        created_on_compile(self.project, self.program, ti, body)
+    }
+
+    fn monitor_def(&self, m: &scrust_sb3::Monitor) -> Option<String> {
+        let MonitorInfo { sprite, index, label, param: extra } = monitor_info(self.program, m)?;
+        Some(format!(
+            "            MonitorDef {{ id: {}, opcode: {}, mode: {}, label: {}, sprite: {}, index: {}, param: {}, x: {}, y: {}, width: {}, height: {}, visible: {}, slider_min: {}, slider_max: {}, is_discrete: {} }},\n",
+            rust_str(&m.id),
+            rust_str(&m.opcode),
+            rust_str(&m.mode),
+            rust_str(&label),
+            sprite,
+            index,
+            rust_str(&extra),
+            f64_lit(m.x),
+            f64_lit(m.y),
+            f64_lit(m.width),
+            f64_lit(m.height),
+            m.visible,
+            f64_lit(m.slider_min),
+            f64_lit(m.slider_max),
+            m.is_discrete
+        ))
+    }
+}
+
+/// Variables and lists of target `ti` that the project does not declare
+/// but `body` (or a procedure it calls, transitively) refers to: TurboWarp
+/// creates them when it compiles the script (`_descendVariable`), in the
+/// order it meets them.
+pub fn created_on_compile(project: &Project, program: &Program, ti: usize, body: &[Stmt]) -> Vec<(bool, u16)> {
+    {
+        let src = &project.targets[ti];
         let (nv, nl) = (src.variables.len(), src.lists.len());
         let mut out: Vec<(bool, u16)> = Vec::new();
         let mut seen_procs: Vec<usize> = Vec::new();
@@ -375,15 +408,27 @@ impl<'a> Gen<'a> {
             for pi in calls.into_iter().rev() {
                 if !seen_procs.contains(&pi) {
                     seen_procs.push(pi);
-                    stack.push(&self.program.targets[ti].procs[pi].body);
+                    stack.push(&program.targets[ti].procs[pi].body);
                 }
             }
         }
         out
     }
+}
 
-    fn monitor_def(&self, m: &scrust_sb3::Monitor) -> Option<String> {
-        let p = self.program;
+/// What a monitor shows, resolved against the program.
+pub struct MonitorInfo {
+    /// Target index owning the monitored value (0 = stage / global).
+    pub sprite: usize,
+    /// Variable / list declaration index for data monitors.
+    pub index: usize,
+    pub label: String,
+    /// Extra parameter (e.g. NUMBER_NAME, CURRENTMENU).
+    pub param: String,
+}
+
+pub fn monitor_info(p: &Program, m: &scrust_sb3::Monitor) -> Option<MonitorInfo> {
+    {
         let sprite = match &m.sprite_name {
             Some(n) => p.targets.iter().position(|t| !t.is_stage && t.name == *n)?,
             None => 0,
@@ -426,26 +471,11 @@ impl<'a> Gen<'a> {
             }
         };
         let label = if sprite != 0 { format!("{}: {}", p.targets[sprite].name, label) } else { label };
-        Some(format!(
-            "            MonitorDef {{ id: {}, opcode: {}, mode: {}, label: {}, sprite: {}, index: {}, param: {}, x: {}, y: {}, width: {}, height: {}, visible: {}, slider_min: {}, slider_max: {}, is_discrete: {} }},\n",
-            rust_str(&m.id),
-            rust_str(&m.opcode),
-            rust_str(&m.mode),
-            rust_str(&label),
-            sprite,
-            index,
-            rust_str(&extra),
-            f64_lit(m.x),
-            f64_lit(m.y),
-            f64_lit(m.width),
-            f64_lit(m.height),
-            m.visible,
-            f64_lit(m.slider_min),
-            f64_lit(m.slider_max),
-            m.is_discrete
-        ))
+        Some(MonitorInfo { sprite, index, label, param: extra })
     }
+}
 
+impl<'a> Gen<'a> {
     // ----------------------------------------------------------- sprite module
 
     fn sprite_module(&mut self, ti: usize) -> String {

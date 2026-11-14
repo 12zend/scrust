@@ -20,7 +20,13 @@ git clone --depth 1 -b develop https://github.com/scratchfoundation/scratch-vm.g
 node conformance/harness/run.js
 ```
 
-Builds every case in `tests/*.js` with the sb3 DSL (`harness/sb3.js`), traces it in scratch-vm (`harness/trace.js`) and in scrust (`scrust trace`), and compares the JSON-lines output byte for byte. Each case runs twice: `--no-unbox` (exact, type tags included) and unboxed (canonical numeric strings equal their numbers). Options: `--only <substr>`, `--mode nounbox|unbox|both`, `--jobs N`, `--release`.
+Builds every case in `tests/*.js` with the sb3 DSL (`harness/sb3.js`), traces it in scratch-vm (`harness/trace.js`) and in scrust (`scrust trace`), and compares the JSON-lines output byte for byte. Each case runs twice: `--no-unbox` (exact, type tags included) and unboxed (canonical numeric strings equal their numbers). Options: `--only <substr>`, `--mode nounbox|unbox|both|interp|all` (`interp`: the IR interpreter, `scrust trace --interp`), `--ref scratch-vm|compiled`, `--jobs N`, `--release`.
+
+`--ref compiled` takes the compiled `--no-unbox` program as the reference instead of scratch-vm, so it needs no scratch-vm checkout; it checks the interpreter against the compiler:
+
+```bash
+node conformance/harness/run.js --ref compiled --mode interp --release
+```
 
 The fuzzer scales with environment variables:
 

@@ -65,7 +65,13 @@ pub fn install_native_clock(w: &mut World) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn main(program: ProgramDef, defaults: Options) {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let (args, _rest) = parse_args(defaults, &argv);
+    main_with_args(program, defaults, &argv);
+}
+
+/// `main` with explicit arguments (for hosts that build the program in-process).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn main_with_args(program: ProgramDef, defaults: Options, argv: &[String]) {
+    let (args, _rest) = parse_args(defaults, argv);
     let program: &'static ProgramDef = Box::leak(Box::new(program));
     let mut w = World::new(program, args.options.clone());
     if !args.options.deterministic {

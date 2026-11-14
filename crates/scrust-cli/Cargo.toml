@@ -14,3 +14,5 @@ scrust-sb3.workspace = true
 scrust-ir.workspace = true
 scrust-analysis.workspace = true
 scrust-codegen.workspace = true
+scrust-runtime.workspace = true
+scrust-interp.workspace = true
