@@ -1,6 +1,7 @@
 //! scrust runtime: scheduler, world state and block primitives used by
 //! generated code.
 
+pub mod alloc;
 pub mod blocks;
 pub mod cli;
 pub mod list;
@@ -25,7 +26,7 @@ pub mod prelude {
     pub use crate::{val_bool, val_num, val_str};
     pub use scrust_value::ops;
     pub use scrust_value::{
-        compare, compare_str_ci, js_num_to_str, js_round, num_eq, num_gt, num_lt, num_to_list_index, JsStr, ListIndex, MathOp, ToBool, ToNum, ToStr, ToValue, Value,
+        compare, compare_lit, compare_str_ci, compare_val_str, js_num_to_str, js_round, num_eq, num_gt, num_lt, num_to_list_index, JsStr, ListIndex, MathOp, ToBool, ToNum, ToStr, ToValue, Value,
     };
 }
 
@@ -103,4 +104,95 @@ pub fn run_headless(w: &mut World, frames: u64, mut on_frame: impl FnMut(&World)
             on_frame(&*wp);
         }
     }
+}
+
+/// Headless browser/Node build used for benchmarks (`scrust build --target
+/// wasm --headless`): no renderer, no audio, deterministic clock, one pass
+/// per frame.
+#[cfg(target_arch = "wasm32")]
+pub mod webbench {
+    use crate::{set_world_ptr, Options, ProgramDef, World};
+    use std::cell::Cell;
+
+    thread_local! {
+        static WORLD: Cell<*mut World> = const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    pub fn init(program: ProgramDef, mut options: Options, seed: u32) {
+        let program: &'static ProgramDef = Box::leak(Box::new(program));
+        options.deterministic = true;
+        options.max_passes = Some(1);
+        options.seed = seed;
+        let w: &'static mut World = Box::leak(World::new(program, options));
+        let wp: *mut World = w;
+        WORLD.with(|c| c.set(wp));
+        // SAFETY: the world lives for the rest of the program and is only
+        // reached through `wp`.
+        unsafe {
+            set_world_ptr(wp);
+            (*wp).green_flag();
+        }
+    }
+
+    thread_local! {
+        static TRACE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+
+    /// The trace line of the current frame (as `--trace` prints it); returns
+    /// its length, the UTF-8 bytes are at `trace_ptr`.
+    pub fn trace() -> u32 {
+        let wp = WORLD.with(|c| c.get());
+        if wp.is_null() {
+            return 0;
+        }
+        // SAFETY: see `init`.
+        let line = unsafe { (*wp).trace_line() };
+        TRACE.with(|t| {
+            *t.borrow_mut() = line;
+            t.borrow().len() as u32
+        })
+    }
+
+    pub fn trace_ptr() -> *const u8 {
+        TRACE.with(|t| t.borrow().as_ptr())
+    }
+
+    /// One frame; returns the number of live threads.
+    pub fn step() -> u32 {
+        let wp = WORLD.with(|c| c.get());
+        if wp.is_null() {
+            return 0;
+        }
+        // SAFETY: see `init`.
+        unsafe {
+            crate::sched::step(wp);
+            (*wp).live_threads() as u32
+        }
+    }
+}
+
+/// Exports of a headless wasm build (see `webbench`).
+#[macro_export]
+macro_rules! headless_web_exports {
+    ($program:ident, $options:ident) => {
+        #[cfg(target_arch = "wasm32")]
+        mod __scrust_webbench {
+            #[no_mangle]
+            pub extern "C" fn scrust_bench_init(seed: u32) {
+                $crate::webbench::init(super::$program(), super::$options(), seed);
+            }
+            #[no_mangle]
+            pub extern "C" fn scrust_bench_step() -> u32 {
+                $crate::webbench::step()
+            }
+            #[no_mangle]
+            pub extern "C" fn scrust_bench_trace() -> u32 {
+                $crate::webbench::trace()
+            }
+            #[no_mangle]
+            pub extern "C" fn scrust_bench_trace_ptr() -> *const u8 {
+                $crate::webbench::trace_ptr()
+            }
+        }
+    };
 }

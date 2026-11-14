@@ -5,7 +5,7 @@
 //! * Concatenation builds a rope which is flattened lazily, once.
 //! * `JsStr` is a thin pointer, so `Value` fits in 16 bytes.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::fmt;
 use std::rc::Rc;
@@ -17,6 +17,34 @@ const ROPE_MIN: usize = 24;
 enum Flat {
     L1(Box<[u8]>),
     U16(Box<[u16]>),
+    /// Short Latin-1 contents stored in the node itself (one allocation
+    /// per string instead of two).
+    Small(u8, [u8; SMALL]),
+}
+
+const SMALL: usize = 22;
+
+impl Flat {
+    #[inline]
+    fn as_ref(&self) -> FlatRef<'_> {
+        match self {
+            Flat::L1(s) => FlatRef::L1(s),
+            Flat::U16(s) => FlatRef::U16(s),
+            Flat::Small(n, b) => FlatRef::L1(&b[..*n as usize]),
+        }
+    }
+
+    /// Latin-1 contents, inline when short.
+    #[inline]
+    fn l1(b: &[u8]) -> Flat {
+        if b.len() <= SMALL {
+            let mut buf = [0u8; SMALL];
+            buf[..b.len()].copy_from_slice(b);
+            Flat::Small(b.len() as u8, buf)
+        } else {
+            Flat::L1(b.into())
+        }
+    }
 }
 
 /// Borrowed view of flattened string contents.
@@ -68,8 +96,14 @@ struct Node {
     len: usize,
     /// True when every code unit is <= 0xFF.
     l1: bool,
+    /// `Number(this)` once computed (bits; `NUM_UNKNOWN` before). Strings
+    /// are immutable, so like V8's cached array index this never goes stale.
+    num: Cell<u64>,
     repr: Repr,
 }
+
+/// A NaN payload no arithmetic produces: "not parsed yet".
+const NUM_UNKNOWN: u64 = 0x7ff4_dead_beef_0001;
 
 impl Drop for Node {
     fn drop(&mut self) {
@@ -104,8 +138,9 @@ impl JsStr {
         let (len, l1) = match &f {
             Flat::L1(s) => (s.len(), true),
             Flat::U16(s) => (s.len(), false),
+            Flat::Small(n, _) => (*n as usize, true),
         };
-        JsStr(Rc::new(Node { len, l1, repr: Repr::Flat(f) }))
+        JsStr(Rc::new(Node { len, l1, num: Cell::new(NUM_UNKNOWN), repr: Repr::Flat(f) }))
     }
 
     #[inline]
@@ -127,7 +162,7 @@ impl JsStr {
         match b.len() {
             0 => JsStr::empty(),
             1 => JsStr::from_unit(b[0] as u16),
-            _ => JsStr::new_flat(Flat::L1(b.into())),
+            _ => JsStr::new_flat(Flat::l1(b)),
         }
     }
 
@@ -135,6 +170,7 @@ impl JsStr {
         match b.len() {
             0 => JsStr::empty(),
             1 => JsStr::from_unit(b[0] as u16),
+            n if n <= SMALL => JsStr::new_flat(Flat::l1(&b)),
             _ => JsStr::new_flat(Flat::L1(b.into_boxed_slice())),
         }
     }
@@ -164,6 +200,26 @@ impl JsStr {
         self.0.len == 0
     }
 
+    /// `Number(this)`, parsed once per string.
+    #[inline]
+    pub fn cached_number(&self, parse: impl FnOnce(&JsStr) -> f64) -> f64 {
+        let bits = self.0.num.get();
+        if bits != NUM_UNKNOWN {
+            return f64::from_bits(bits);
+        }
+        let n = parse(self);
+        // Canonical NaN, so that the sentinel cannot be stored.
+        let n = if n.is_nan() { f64::NAN } else { n };
+        self.0.num.set(n.to_bits());
+        n
+    }
+
+    /// True when every code unit is <= 0xFF.
+    #[inline]
+    pub fn is_latin1(&self) -> bool {
+        self.0.l1
+    }
+
     #[inline]
     pub fn ptr_eq(&self, other: &JsStr) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
@@ -182,10 +238,7 @@ impl JsStr {
                 f
             }),
         };
-        match f {
-            Flat::L1(s) => FlatRef::L1(s),
-            Flat::U16(s) => FlatRef::U16(s),
-        }
+        f.as_ref()
     }
 
     fn flatten(&self) -> Flat {
@@ -222,11 +275,9 @@ impl JsStr {
 
     fn peek(&self) -> Peek<'_> {
         match &self.0.repr {
-            Repr::Flat(Flat::L1(s)) => Peek::Flat(FlatRef::L1(s)),
-            Repr::Flat(Flat::U16(s)) => Peek::Flat(FlatRef::U16(s)),
+            Repr::Flat(f) => Peek::Flat(f.as_ref()),
             Repr::Cons(c) => match c.flat.get() {
-                Some(Flat::L1(s)) => Peek::Flat(FlatRef::L1(s)),
-                Some(Flat::U16(s)) => Peek::Flat(FlatRef::U16(s)),
+                Some(f) => Peek::Flat(f.as_ref()),
                 None => {
                     let p = c.parts.borrow();
                     let (a, b) = p.as_ref().expect("unflattened rope has parts");
@@ -259,6 +310,12 @@ impl JsStr {
         let l1 = self.0.l1 && other.0.l1;
         if len <= ROPE_MIN {
             return match (self.flat(), other.flat()) {
+                (FlatRef::L1(a), FlatRef::L1(b)) if len <= SMALL => {
+                    let mut buf = [0u8; SMALL];
+                    buf[..a.len()].copy_from_slice(a);
+                    buf[a.len()..len].copy_from_slice(b);
+                    JsStr::new_flat(Flat::Small(len as u8, buf))
+                }
                 (FlatRef::L1(a), FlatRef::L1(b)) => {
                     let mut v = Vec::with_capacity(len);
                     v.extend_from_slice(a);
@@ -276,6 +333,7 @@ impl JsStr {
         JsStr(Rc::new(Node {
             len,
             l1,
+            num: Cell::new(NUM_UNKNOWN),
             repr: Repr::Cons(Cons {
                 parts: RefCell::new(Some((self.clone(), other.clone()))),
                 flat: OnceCell::new(),
@@ -296,7 +354,11 @@ impl JsStr {
     }
 
     /// Exact (case-sensitive) equality with an ASCII/Unicode `&str`.
+    #[inline]
     pub fn eq_str(&self, s: &str) -> bool {
+        if s.is_ascii() && s.len() != self.len() {
+            return false;
+        }
         match self.flat() {
             FlatRef::L1(a) if s.is_ascii() => a == s.as_bytes(),
             f => f.units().eq(s.encode_utf16()),

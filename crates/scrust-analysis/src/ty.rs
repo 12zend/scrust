@@ -19,7 +19,9 @@ impl Ty {
     pub const NAN: Ty = Ty(1 << 8);
     /// Canonical numeric string without a fraction (`"10"`, `"-3"`, `"0"`).
     pub const STR_CINT: Ty = Ty(1 << 9);
-    /// Canonical numeric string with a fraction (`"1.5"`).
+    /// Canonical numeric string with a fraction of more than two digits
+    /// (`"1.125"`): `say` (two decimals) and monitors (six) show it
+    /// differently from its number.
     pub const STR_CFRACT: Ty = Ty(1 << 10);
     /// Other strings with a numeric interpretation (`"1.0"`, `" 5"`, `"0x10"`, `"-0"`, `"Infinity"`).
     pub const STR_NUM: Ty = Ty(1 << 11);
@@ -29,6 +31,9 @@ impl Ty {
     pub const STR_BOOL: Ty = Ty(1 << 13);
     pub const BOOL_T: Ty = Ty(1 << 14);
     pub const BOOL_F: Ty = Ty(1 << 15);
+    /// Canonical numeric string with a one or two digit fraction (`"1.5"`,
+    /// `"-0.25"`): shown exactly like its number everywhere.
+    pub const STR_CSHORT: Ty = Ty(1 << 16);
 
     pub const INF: Ty = Ty(Self::POS_INF.0 | Self::NEG_INF.0);
     pub const FRACT: Ty = Ty(Self::POS_FRACT.0 | Self::NEG_FRACT.0);
@@ -38,7 +43,7 @@ impl Ty {
     /// Every number except NaN.
     pub const NUMBER: Ty = Ty(Self::FINITE.0 | Self::INF.0);
     pub const NUMBER_OR_NAN: Ty = Ty(Self::NUMBER.0 | Self::NAN.0);
-    pub const STR_CANON: Ty = Ty(Self::STR_CINT.0 | Self::STR_CFRACT.0);
+    pub const STR_CANON: Ty = Ty(Self::STR_CINT.0 | Self::STR_CFRACT.0 | Self::STR_CSHORT.0);
     pub const STRING: Ty = Ty(Self::STR_CANON.0 | Self::STR_NUM.0 | Self::STR_NAN.0 | Self::STR_BOOL.0);
     pub const BOOLEAN: Ty = Ty(Self::BOOL_T.0 | Self::BOOL_F.0);
     pub const ANY: Ty = Ty(Self::NUMBER_OR_NAN.0 | Self::STRING.0 | Self::BOOLEAN.0);
@@ -74,8 +79,11 @@ impl Ty {
                         Ty::STR_NAN
                     }
                 } else if is_canonical(&s.to_rust_string(), n) {
+                    let text = s.to_rust_string();
                     if n == n.trunc() {
                         Ty::STR_CINT
+                    } else if text.len() - text.find('.').unwrap_or(0) <= 3 {
+                        Ty::STR_CSHORT
                     } else {
                         Ty::STR_CFRACT
                     }
@@ -124,7 +132,7 @@ impl Ty {
         if self.has(Ty::STR_CINT) {
             r |= Ty::INT;
         }
-        if self.has(Ty::STR_CFRACT) {
+        if self.has(Ty::STR_CFRACT) || self.has(Ty::STR_CSHORT) {
             r |= Ty::FRACT;
         }
         if self.has(Ty::STR_NUM) {
@@ -140,7 +148,7 @@ impl Ty {
         if self.has(Ty::STR_CINT) {
             r |= Ty::INT;
         }
-        if self.has(Ty::STR_CFRACT) {
+        if self.has(Ty::STR_CFRACT) || self.has(Ty::STR_CSHORT) {
             r |= Ty::FRACT;
         }
         r
@@ -189,9 +197,9 @@ impl Not for Ty {
 
 impl std::fmt::Debug for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const NAMES: [&str; 16] = [
+        const NAMES: [&str; 17] = [
             "+inf", "+int", "+fract", "0", "-0", "-int", "-fract", "-inf", "NaN", "str:int", "str:fract", "str:num", "str:text", "str:bool",
-            "true", "false",
+            "true", "false", "str:fract2",
         ];
         if *self == Ty::ANY {
             return write!(f, "any");
@@ -290,7 +298,9 @@ mod tests {
         assert_eq!(s("10"), Ty::STR_CINT);
         assert_eq!(s("-3"), Ty::STR_CINT);
         assert_eq!(s("0"), Ty::STR_CINT);
-        assert_eq!(s("1.5"), Ty::STR_CFRACT);
+        assert_eq!(s("1.5"), Ty::STR_CSHORT);
+        assert_eq!(s("-0.25"), Ty::STR_CSHORT);
+        assert_eq!(s("1.125"), Ty::STR_CFRACT);
         assert_eq!(s("1.0"), Ty::STR_NUM);
         assert_eq!(s("-0"), Ty::STR_NUM);
         assert_eq!(s(" 5"), Ty::STR_NUM);

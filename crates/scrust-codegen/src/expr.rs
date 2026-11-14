@@ -280,6 +280,24 @@ impl<'a> Gen<'a> {
     /// Returns (prelude statements, index expression).
     pub fn list_index(&mut self, idx: &E, place: &str, len_plus: usize, accept_all: bool) -> (String, String) {
         let len = if len_plus == 0 { format!("{}.len()", place) } else { format!("{}.len() + {}", place, len_plus) };
+        // A constant index is resolved here (`Cast.toListIndex` on a literal):
+        // only `random` / `any` need the runtime.
+        if let Some(v) = &idx.lit {
+            let s = v.to_str();
+            match v {
+                Value::Str(_) if s.eq_str("all") => {
+                    let ix = if accept_all { "ListIndex::All" } else { "ListIndex::Invalid" };
+                    return (format!("let n_ = {};", len), format!("{{ let _ = n_; {} }}", ix));
+                }
+                Value::Str(_) if s.eq_str("last") => {
+                    return (format!("let n_ = {};", len), "if n_ > 0 { ListIndex::Index(n_) } else { ListIndex::Invalid }".into());
+                }
+                Value::Str(_) if s.eq_str("random") || s.eq_str("any") => {}
+                _ => {
+                    return (format!("let n_ = {};", len), format!("num_to_list_index({}, n_)", f64_lit(v.to_num())));
+                }
+            }
+        }
         let numeric = idx.rt == RT::Num || matches!(idx.lit, Some(Value::Num(_)));
         if numeric && idx.lit.is_none() || matches!(idx.lit, Some(Value::Num(_))) {
             (format!("let i_ = {}; let n_ = {};", idx.num(), len), "num_to_list_index(i_, n_)".into())
@@ -450,6 +468,62 @@ impl<'a> Gen<'a> {
                     let b = usable(&xs[1], &xs[0]).unwrap_or_else(|| format!("&{}", xs[1].val()));
                     format!("(compare({}, {}) {} 0.0)", a, b, sym)
                 };
+                // `dynamic <op> constant`: the constant is folded into its number
+                // and text instead of a `Value` built on every evaluation.
+                let lit_side = |x: &E| -> Option<(f64, String)> {
+                    if x.missing {
+                        return None;
+                    }
+                    let v = x.lit.as_ref()?;
+                    let text = v.to_str().to_rust_string();
+                    if !text.is_ascii() {
+                        return None;
+                    }
+                    let mut n = v.js_number();
+                    if n == 0.0 && scrust_value::is_not_actually_zero(v) {
+                        n = f64::NAN;
+                    }
+                    Some((n, text))
+                };
+                let dyn_val = |x: &E| -> Option<String> {
+                    if x.lit.is_some() || x.missing {
+                        return None;
+                    }
+                    match x.rt {
+                        RT::Val => Some(match &x.place {
+                            Some(p) => format!("&{}", p),
+                            None => format!("&{}", x.code),
+                        }),
+                        RT::Str => Some(format!("&Value::Str({})", x.code)),
+                        _ => None,
+                    }
+                };
+                // A string operand (not a constant) and a dynamic value.
+                let str_dyn = |x: &E| -> Option<String> {
+                    if x.lit.is_some() || x.missing || x.rt != RT::Str {
+                        return None;
+                    }
+                    Some(match &x.place {
+                        Some(p) => format!("&{}", p),
+                        None => format!("&{}", x.code),
+                    })
+                };
+                let val_dyn = |x: &E, other: &E| -> Option<String> {
+                    if x.lit.is_some() || x.missing || x.rt != RT::Val {
+                        return None;
+                    }
+                    Some(match &x.place {
+                        Some(p) if !p.contains("w.") || !other.uses_world() => format!("&{}", p),
+                        _ => format!("&{}", x.code),
+                    })
+                };
+                fn flip(sym: &str) -> &str {
+                    match sym {
+                        "<" => ">",
+                        ">" => "<",
+                        s => s,
+                    }
+                }
                 let code = match (numeric(&xs[0]), numeric(&xs[1])) {
                     (Some((a, false, _)), Some((b, false, _))) => format!("({} {} {})", a, sym, b),
                     (Some((a, _, true)), Some((b, _, true))) => {
@@ -462,6 +536,20 @@ impl<'a> Gen<'a> {
                     }
                     _ if text_const(&xs[0]) || text_const(&xs[1]) => {
                         format!("(compare_str_ci(&{}, &{}) {} 0.0)", xs[0].str(), xs[1].str(), sym)
+                    }
+                    _ if dyn_val(&xs[0]).is_some() && lit_side(&xs[1]).is_some() => {
+                        let (n, t) = lit_side(&xs[1]).unwrap();
+                        format!("(compare_lit({}, {}, {:?}) {} 0.0)", dyn_val(&xs[0]).unwrap(), f64_lit(n), t, sym)
+                    }
+                    _ if str_dyn(&xs[1]).is_some() && val_dyn(&xs[0], &xs[1]).is_some() => {
+                        format!("(compare_val_str({}, {}) {} 0.0)", val_dyn(&xs[0], &xs[1]).unwrap(), str_dyn(&xs[1]).unwrap(), sym)
+                    }
+                    _ if str_dyn(&xs[0]).is_some() && val_dyn(&xs[1], &xs[0]).is_some() => {
+                        format!("(compare_val_str({}, {}) {} 0.0)", val_dyn(&xs[1], &xs[0]).unwrap(), str_dyn(&xs[0]).unwrap(), flip(sym))
+                    }
+                    _ if lit_side(&xs[0]).is_some() && dyn_val(&xs[1]).is_some() => {
+                        let (n, t) = lit_side(&xs[0]).unwrap();
+                        format!("(compare_lit({}, {}, {:?}) {} 0.0)", dyn_val(&xs[1]).unwrap(), f64_lit(n), t, flip(sym))
                     }
                     _ => generic(xs),
                 };

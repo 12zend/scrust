@@ -1,6 +1,6 @@
 //! The dynamic `Value` and the Scratch casts (`Cast.*` in scratch-vm).
 
-use crate::jsstr::JsStr;
+use crate::jsstr::{FlatRef, JsStr};
 use crate::num::{js_is_int_number, js_num_to_str, js_string_to_number};
 use std::cmp::Ordering;
 
@@ -288,12 +288,73 @@ fn ord_to_f64(o: Ordering) -> f64 {
 }
 
 /// `Cast.compare`: negative / zero / positive.
+#[inline]
 pub fn compare(a: &Value, b: &Value) -> f64 {
     if let (Value::Num(x), Value::Num(y)) = (a, b) {
         if !x.is_nan() && !y.is_nan() {
             return if x == y { 0.0 } else { x - y };
         }
     }
+    compare_slow(a, b)
+}
+
+/// The string comparison of `Cast.compare` when one side is a number: the
+/// number's string form starts with a digit, `-`, `I` or `N`, so a string
+/// whose first (lower-cased) unit sorts outside that range decides the order
+/// without formatting the number. Returns `compare(Num(x), s)`.
+fn compare_num_str(x: f64, s: &JsStr) -> f64 {
+    let first = if s.is_empty() { None } else { Some(s.code_unit(0)) };
+    match first {
+        // A number's string is never empty.
+        None => 1.0,
+        Some(u) => {
+            let l = if u < 256 { crate::lower::l1_lower(u as u8) as u16 } else { u };
+            // A finite number's string starts with a digit or `-`.
+            let max = if x.is_finite() { b'9' } else { b'n' } as u16;
+            if u < 256 && l > max {
+                -1.0
+            } else if l < b'-' as u16 {
+                1.0
+            } else {
+                compare_str_ci(&js_num_to_str(x), s)
+            }
+        }
+    }
+}
+
+/// `Cast.compare(a, s)` for a string `s` (without building a `Value`).
+#[inline]
+pub fn compare_val_str(a: &Value, s: &JsStr) -> f64 {
+    if let Value::Num(x) = a {
+        let n2 = js_string_to_number(s);
+        if !x.is_nan() && !n2.is_nan() && n2 != 0.0 {
+            return if *x == n2 { 0.0 } else { x - n2 };
+        }
+    }
+    compare_val_str_slow(a, s)
+}
+
+fn compare_val_str_slow(a: &Value, s: &JsStr) -> f64 {
+    let mut n1 = a.js_number();
+    let mut n2 = js_string_to_number(s);
+    if n1 == 0.0 && is_not_actually_zero(a) {
+        n1 = f64::NAN;
+    } else if n2 == 0.0 && s.is_not_actually_zero() {
+        n2 = f64::NAN;
+    }
+    if n1.is_nan() || n2.is_nan() {
+        return match a {
+            Value::Num(x) => compare_num_str(*x, s),
+            _ => compare_str_ci(&a.to_str(), s),
+        };
+    }
+    if n1 == n2 {
+        return 0.0;
+    }
+    n1 - n2
+}
+
+fn compare_slow(a: &Value, b: &Value) -> f64 {
     let mut n1 = a.js_number();
     let mut n2 = b.js_number();
     if n1 == 0.0 && is_not_actually_zero(a) {
@@ -302,9 +363,11 @@ pub fn compare(a: &Value, b: &Value) -> f64 {
         n2 = f64::NAN;
     }
     if n1.is_nan() || n2.is_nan() {
-        let s1 = a.to_str().to_lower();
-        let s2 = b.to_str().to_lower();
-        return ord_to_f64(s1.cmp_utf16(&s2));
+        return match (a, b) {
+            (Value::Num(x), Value::Str(s)) => compare_num_str(*x, s),
+            (Value::Str(s), Value::Num(y)) => -compare_num_str(*y, s),
+            _ => compare_str_ci(&a.to_str(), &b.to_str()),
+        };
     }
     if n1 == n2 {
         // Covers the +/-Infinity special case (inf - inf would be NaN).
@@ -313,9 +376,114 @@ pub fn compare(a: &Value, b: &Value) -> f64 {
     n1 - n2
 }
 
+/// `Cast.compare(a, literal)` for a constant `literal` whose `Number()` is
+/// `n2` (NaN when it is a string that `isNotActuallyZero` turns into NaN)
+/// and whose string form is the ASCII `text`.
+#[inline]
+pub fn compare_lit(a: &Value, n2: f64, text: &'static str) -> f64 {
+    if let Value::Num(x) = a {
+        if !x.is_nan() && !n2.is_nan() {
+            return if *x == n2 { 0.0 } else { x - n2 };
+        }
+    }
+    compare_lit_slow(a, n2, text)
+}
+
+fn compare_lit_slow(a: &Value, n2: f64, text: &'static str) -> f64 {
+    let mut n1 = a.js_number();
+    if n1 == 0.0 && is_not_actually_zero(a) {
+        n1 = f64::NAN;
+    }
+    if n1.is_nan() || n2.is_nan() {
+        let s = a.to_str();
+        if let FlatRef::L1(x) = s.flat() {
+            let t = text.as_bytes();
+            return ord_to_f64(x.iter().map(|&c| crate::lower::l1_lower(c)).cmp(t.iter().map(|&c| crate::lower::l1_lower(c))));
+        }
+        return compare_str_ci(&s, &JsStr::from(text));
+    }
+    if n1 == n2 {
+        return 0.0;
+    }
+    n1 - n2
+}
+
+/// One side of `Cast.compare(x, key) === 0` converted once, for scanning
+/// many `x` (`item # of`, `list contains`).
+pub struct CompareKey {
+    /// `Number(key)`; NaN when the comparison is a string comparison.
+    n: f64,
+    s: JsStr,
+}
+
+impl CompareKey {
+    pub fn new(key: &Value) -> CompareKey {
+        let mut n = key.js_number();
+        if n == 0.0 && is_not_actually_zero(key) {
+            n = f64::NAN;
+        }
+        CompareKey { n, s: key.to_str() }
+    }
+
+    #[inline]
+    pub fn eq_num(&self, x: f64) -> bool {
+        if !x.is_nan() && !self.n.is_nan() {
+            return x == self.n;
+        }
+        eq_ci(&js_num_to_str(x), &self.s)
+    }
+
+    pub fn eq_str(&self, t: &JsStr) -> bool {
+        let mut n1 = js_string_to_number(t);
+        if n1 == 0.0 && t.is_not_actually_zero() {
+            n1 = f64::NAN;
+        }
+        if n1.is_nan() || self.n.is_nan() {
+            return eq_ci(t, &self.s);
+        }
+        n1 == self.n
+    }
+
+    pub fn eq_bool(&self, b: bool) -> bool {
+        let n1 = b as u8 as f64;
+        if self.n.is_nan() {
+            return eq_ci(&b.to_str(), &self.s);
+        }
+        n1 == self.n
+    }
+
+    #[inline]
+    pub fn eq_value(&self, v: &Value) -> bool {
+        match v {
+            Value::Num(x) => self.eq_num(*x),
+            Value::Str(t) => self.eq_str(t),
+            Value::Bool(b) => self.eq_bool(*b),
+        }
+    }
+}
+
+/// Case-insensitive equality (`compare_str_ci(a, b) == 0`).
+fn eq_ci(a: &JsStr, b: &JsStr) -> bool {
+    if a.ptr_eq(b) {
+        return true;
+    }
+    if let (FlatRef::L1(x), FlatRef::L1(y)) = (a.flat(), b.flat()) {
+        // Latin-1 lower-casing keeps the length.
+        return x.len() == y.len() && x.iter().zip(y).all(|(&c, &d)| c == d || crate::lower::l1_lower(c) == crate::lower::l1_lower(d));
+    }
+    compare_str_ci(a, b) == 0.0
+}
+
 /// Case-insensitive string comparison branch of `Cast.compare`, for callers
 /// that have statically proven the comparison is a string comparison.
 pub fn compare_str_ci(a: &JsStr, b: &JsStr) -> f64 {
+    if a.ptr_eq(b) {
+        return 0.0;
+    }
+    // Latin-1 lower-casing maps every unit to one unit: compare in place.
+    if let (FlatRef::L1(x), FlatRef::L1(y)) = (a.flat(), b.flat()) {
+        return ord_to_f64(x.iter().map(|&c| crate::lower::l1_lower(c)).cmp(y.iter().map(|&c| crate::lower::l1_lower(c))));
+    }
     ord_to_f64(a.to_lower().cmp_utf16(&b.to_lower()))
 }
 
@@ -353,6 +521,11 @@ pub enum ListIndex {
 /// non-empty list.
 pub fn to_list_index(v: &Value, len: usize, accept_all: bool, rand: &mut dyn FnMut() -> f64) -> ListIndex {
     if let Value::Str(s) = v {
+        // The keywords are not numbers (and the number is cached on the string).
+        let n = js_string_to_number(s);
+        if !n.is_nan() || !matches!(s.len(), 3 | 4 | 6) {
+            return num_to_list_index(if n.is_nan() { 0.0 } else { n }, len);
+        }
         if s.eq_str("all") {
             return if accept_all { ListIndex::All } else { ListIndex::Invalid };
         }

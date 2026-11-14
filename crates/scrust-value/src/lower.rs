@@ -4,7 +4,7 @@
 use crate::jsstr::{FlatRef, JsStr};
 
 #[inline]
-fn l1_lower(c: u8) -> u8 {
+pub(crate) fn l1_lower(c: u8) -> u8 {
     match c {
         b'A'..=b'Z' => c + 32,
         0xC0..=0xDE if c != 0xD7 => c + 32,

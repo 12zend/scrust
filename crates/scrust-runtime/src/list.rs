@@ -1,6 +1,6 @@
 //! Scratch lists with a statically chosen element representation.
 
-use scrust_value::{compare, JsStr, ListIndex, ToNum, ToStr, ToValue, Value};
+use scrust_value::{compare, CompareKey, JsStr, ListIndex, ToNum, ToStr, ToValue, Value};
 
 
 /// Element representations: `f64`, `bool`, `JsStr` or `Value`.
@@ -11,9 +11,15 @@ pub trait Elem: Clone + ToNum + ToStr + ToValue + 'static {
     fn equals_value(&self, other: &Value) -> bool;
     /// Is `String(self)` one code unit long (TurboWarp's `listContents`)?
     fn is_single_char(&self) -> bool;
+    /// `Cast.compare(self, key) === 0`
+    fn eq_key(&self, key: &CompareKey) -> bool;
 }
 
 impl Elem for Value {
+    #[inline]
+    fn eq_key(&self, key: &CompareKey) -> bool {
+        key.eq_value(self)
+    }
     #[inline]
     fn from_value(v: &Value) -> Self {
         v.clone()
@@ -32,6 +38,10 @@ impl Elem for Value {
     }
 }
 impl Elem for f64 {
+    #[inline]
+    fn eq_key(&self, key: &CompareKey) -> bool {
+        key.eq_num(*self)
+    }
     #[inline]
     fn from_value(v: &Value) -> Self {
         match v {
@@ -55,6 +65,10 @@ impl Elem for f64 {
 }
 impl Elem for bool {
     #[inline]
+    fn eq_key(&self, key: &CompareKey) -> bool {
+        key.eq_bool(*self)
+    }
+    #[inline]
     fn from_value(v: &Value) -> Self {
         matches!(v, Value::Bool(true))
     }
@@ -68,6 +82,10 @@ impl Elem for bool {
     }
 }
 impl Elem for JsStr {
+    #[inline]
+    fn eq_key(&self, key: &CompareKey) -> bool {
+        key.eq_str(self)
+    }
     #[inline]
     fn from_value(v: &Value) -> Self {
         v.to_str()
@@ -202,7 +220,8 @@ impl<T: Elem> List<T> {
 
     /// `data_itemnumoflist`
     pub fn index_of(&self, v: &Value) -> f64 {
-        match self.items.iter().position(|x| x.equals_value(v)) {
+        let key = CompareKey::new(v);
+        match self.items.iter().position(|x| x.eq_key(&key)) {
             Some(i) => (i + 1) as f64,
             None => 0.0,
         }
@@ -210,7 +229,8 @@ impl<T: Elem> List<T> {
 
     /// `data_listcontainsitem` (the identity pre-check is subsumed by compare).
     pub fn contains(&self, v: &Value) -> bool {
-        self.items.iter().any(|x| x.equals_value(v))
+        let key = CompareKey::new(v);
+        self.items.iter().any(|x| x.eq_key(&key))
     }
 
     /// `data_listcontents`

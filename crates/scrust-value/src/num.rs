@@ -15,7 +15,12 @@ pub fn is_js_whitespace(u: u16) -> bool {
 }
 
 /// ECMAScript `StringToNumber` (i.e. `Number(string)`). May return NaN.
+#[inline]
 pub fn js_string_to_number(s: &JsStr) -> f64 {
+    s.cached_number(parse_string_number)
+}
+
+fn parse_string_number(s: &JsStr) -> f64 {
     match s.flat() {
         FlatRef::L1(b) => {
             // Fast path: short run of ASCII digits.
@@ -192,7 +197,12 @@ pub fn js_number_to_string(x: f64) -> String {
         Some(m) => (true, m),
         None => (false, mant),
     };
-    let mut digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let mut digits = String::with_capacity(mant.len());
+    for c in mant.chars() {
+        if c != '.' {
+            digits.push(c);
+        }
+    }
     let mut n = exp + 1;
     fix_tie_to_even(x.abs(), &mut digits, &mut n);
     let k = digits.len() as i32;
@@ -297,7 +307,158 @@ pub fn js_num_to_str(x: f64) -> JsStr {
     if x >= 0.0 && x < 10.0 && x == x.trunc() {
         return JsStr::from_unit(b'0' as u16 + x as u16);
     }
-    JsStr::from_latin1_vec(js_number_to_string(x).into_bytes())
+    // Other integers: digits straight into a stack buffer.
+    if x.abs() < 9007199254740992.0 && x == x.trunc() && x != 0.0 {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        let mut n = x.abs() as u64;
+        while n > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        if x < 0.0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        return JsStr::from_latin1(&buf[i..]);
+    }
+    // Like V8's number-string cache: a direct-mapped table of recent results.
+    NUM_STR_CACHE.with(|c| {
+        let bits = x.to_bits();
+        let slot = ((bits ^ (bits >> 29) ^ (bits >> 47)) as usize) & (NUM_STR_CACHE_SIZE - 1);
+        let mut c = c.borrow_mut();
+        if let Some((b, s)) = &c[slot] {
+            if *b == bits {
+                return s.clone();
+            }
+        }
+        let s = fmt_number(x);
+        c[slot] = Some((bits, s.clone()));
+        s
+    })
+}
+
+const NUM_STR_CACHE_SIZE: usize = 1024;
+
+/// A `fmt::Write` sink on the stack.
+struct StackBuf {
+    buf: [u8; 40],
+    len: usize,
+}
+
+impl std::fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let b = s.as_bytes();
+        if self.len + b.len() > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+        Ok(())
+    }
+}
+
+/// `js_number_to_string` without heap allocation (finite, non-integer `x`;
+/// falls back to it for anything else, including possible digit ties).
+fn fmt_number(x: f64) -> JsStr {
+    use std::fmt::Write as _;
+    if !x.is_finite() || x == x.trunc() {
+        return JsStr::from_latin1_vec(js_number_to_string(x).into_bytes());
+    }
+    let mut sci = StackBuf { buf: [0; 40], len: 0 };
+    if write!(sci, "{:e}", x).is_err() {
+        return JsStr::from_latin1_vec(js_number_to_string(x).into_bytes());
+    }
+    let sci = &sci.buf[..sci.len];
+    let epos = sci.iter().position(|&c| c == b'e').expect("scientific format");
+    let (mant, exp) = (&sci[..epos], &sci[epos + 1..]);
+    let (eneg, exp) = match exp.first() {
+        Some(b'-') => (true, &exp[1..]),
+        _ => (false, exp),
+    };
+    let mut e: i32 = 0;
+    for &c in exp {
+        e = e * 10 + (c - b'0') as i32;
+    }
+    if eneg {
+        e = -e;
+    }
+    let (neg, mant) = match mant.first() {
+        Some(b'-') => (true, &mant[1..]),
+        _ => (false, mant),
+    };
+    let mut digits = [0u8; 24];
+    let mut k = 0usize;
+    for &c in mant {
+        if c != b'.' {
+            digits[k] = c;
+            k += 1;
+        }
+    }
+    let n = e + 1;
+    // Possible tie between two shortest candidates (see `fix_tie_to_even`).
+    let a = x.abs();
+    let bits = a.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, be) = if raw_exp == 0 { (frac, -1074) } else { (frac | (1u64 << 52), raw_exp - 1075) };
+    let e_odd = be + m.trailing_zeros() as i32;
+    if !(e_odd >= 0 || -e_odd != k as i32 - n + 1) {
+        return JsStr::from_latin1_vec(js_number_to_string(x).into_bytes());
+    }
+    let digits = &digits[..k];
+    let k = k as i32;
+    let mut out = StackBuf { buf: [0; 40], len: 0 };
+    let mut push = |b: &[u8]| {
+        out.buf[out.len..out.len + b.len()].copy_from_slice(b);
+        out.len += b.len();
+    };
+    if neg {
+        push(b"-");
+    }
+    if k <= n && n <= 21 {
+        push(digits);
+        for _ in 0..(n - k) {
+            push(b"0");
+        }
+    } else if 0 < n && n <= 21 {
+        push(&digits[..n as usize]);
+        push(b".");
+        push(&digits[n as usize..]);
+    } else if -6 < n && n <= 0 {
+        push(b"0.");
+        for _ in 0..(-n) {
+            push(b"0");
+        }
+        push(digits);
+    } else {
+        let ee = n - 1;
+        push(&digits[..1]);
+        if k > 1 {
+            push(b".");
+            push(&digits[1..]);
+        }
+        push(b"e");
+        push(if ee < 0 { b"-" } else { b"+" });
+        let mut eb = [0u8; 4];
+        let mut i = eb.len();
+        let mut v = ee.unsigned_abs();
+        loop {
+            i -= 1;
+            eb[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        push(&eb[i..]);
+    }
+    JsStr::from_latin1(&out.buf[..out.len])
+}
+
+thread_local! {
+    static NUM_STR_CACHE: std::cell::RefCell<Vec<Option<(u64, JsStr)>>> = std::cell::RefCell::new(vec![None; NUM_STR_CACHE_SIZE]);
 }
 
 /// `Math.round`: ties go toward +Infinity.
